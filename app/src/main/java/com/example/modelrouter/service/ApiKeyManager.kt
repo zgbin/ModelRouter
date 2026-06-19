@@ -53,12 +53,15 @@ object ApiKeyManager {
     }
 
     private fun saveWorkKeys() {
-        prefs.edit().putString("work_keys_json", gson.toJson(workKeys)).apply()
+        val json = gson.toJson(workKeys)
+        prefs.edit().putString("work_keys_json", json).apply()
+        ConfigBackupManager.backupApiKeys(buildKeysBackupJson())
     }
 
     fun setSpeedTestKey(key: String) {
         speedTestKey = key
         prefs.edit().putString("speed_test_key", key).apply()
+        ConfigBackupManager.backupApiKeys(buildKeysBackupJson())
     }
 
     fun getSpeedTestKeyDisplay(): String = speedTestKey
@@ -79,6 +82,7 @@ object ApiKeyManager {
     fun setMaxPerMinute(max: Int) {
         maxPerMinute.set(max)
         prefs.edit().putInt("max_per_minute", max).apply()
+        ConfigBackupManager.backupApiKeys(buildKeysBackupJson())
     }
 
     fun getMaxPerMinute(): Int = maxPerMinute.get()
@@ -86,11 +90,21 @@ object ApiKeyManager {
     fun setSwitchThreshold(threshold: Int) {
         switchThreshold.set(threshold)
         prefs.edit().putInt("switch_threshold", threshold).apply()
+        ConfigBackupManager.backupApiKeys(buildKeysBackupJson())
     }
 
     fun getSwitchThreshold(): Int = switchThreshold.get()
 
     fun reloadKeys() = loadKeys()
+
+    private fun buildKeysBackupJson(): String {
+        val keysMap = mutableMapOf<String, Any?>()
+        keysMap["speed_test_key"] = speedTestKey
+        keysMap["work_keys_json"] = gson.toJson(workKeys)
+        keysMap["max_per_minute"] = maxPerMinute.get()
+        keysMap["switch_threshold"] = switchThreshold.get()
+        return gson.toJson(keysMap)
+    }
 
     private fun resetCountersIfNewMinute() {
         val currentMinute = (System.currentTimeMillis() / 60000).toInt()

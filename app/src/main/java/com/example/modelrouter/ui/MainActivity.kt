@@ -19,6 +19,7 @@ import androidx.activity.viewModels
 import com.example.modelrouter.R
 import com.example.modelrouter.databinding.ActivityMainBinding
 import com.example.modelrouter.service.ApiKeyManager
+import com.example.modelrouter.service.ConfigBackupManager
 import com.example.modelrouter.service.ConfigManager
 import com.example.modelrouter.service.ModelRouterServer
 import com.example.modelrouter.service.ProviderManager
@@ -81,6 +82,8 @@ class MainActivity : AppCompatActivity() {
         ApiKeyManager.init(applicationContext)
         ConfigManager.init(applicationContext)
         ProviderManager.init(applicationContext)
+        ConfigBackupManager.init(applicationContext)
+        ConfigBackupManager.restoreIfNeeded()
 
         binding = ActivityMainBinding.inflate(layoutInflater)
         setContentView(binding.root)

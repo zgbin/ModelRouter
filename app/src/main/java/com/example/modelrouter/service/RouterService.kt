@@ -47,6 +47,7 @@ class RouterService : Service() {
         createNotificationChannel()
         startForeground(NOTIFICATION_ID, buildNotification("服务运行中 · 端口 8190-8194"))
         Log.i(TAG, "RouterService created and started foreground")
+        HealthChecker.start()
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
@@ -69,6 +70,7 @@ class RouterService : Service() {
 
     override fun onDestroy() {
         isRunning = false
+        HealthChecker.stop()
         super.onDestroy()
         Log.i(TAG, "RouterService destroyed")
     }

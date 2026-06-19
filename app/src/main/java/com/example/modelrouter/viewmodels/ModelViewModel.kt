@@ -8,6 +8,7 @@ import androidx.lifecycle.MutableLiveData
 import androidx.lifecycle.viewModelScope
 import com.example.modelrouter.models.*
 import com.example.modelrouter.network.NvidiaApiClient
+import com.example.modelrouter.service.ConfigBackupManager
 import com.example.modelrouter.service.ConfigManager
 import com.example.modelrouter.utils.Constants
 import com.google.gson.Gson
@@ -55,6 +56,7 @@ class ModelViewModel(application: Application) : AndroidViewModel(application) {
         val groups = _groups.value ?: return
         val json = gson.toJson(groups)
         prefs.edit().putString("saved_groups", json).apply()
+        ConfigBackupManager.backupGroups(json)
         ConfigManager.reload()
     }
 

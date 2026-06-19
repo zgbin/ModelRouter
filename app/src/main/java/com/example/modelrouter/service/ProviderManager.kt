@@ -65,7 +65,9 @@ object ProviderManager {
     }
 
     private fun saveProviders() {
-        prefs.edit().putString(KEY_PROVIDERS, gson.toJson(providers.toList())).apply()
+        val json = gson.toJson(providers.toList())
+        prefs.edit().putString(KEY_PROVIDERS, json).apply()
+        ConfigBackupManager.backupProviders(json)
     }
 
     private fun createDefaultProviders(): List<ProviderInfo> {

@@ -80,10 +80,11 @@ class MainActivity : AppCompatActivity() {
         super.onCreate(savedInstanceState)
 
         ApiKeyManager.init(applicationContext)
-        ConfigManager.init(applicationContext)
-        ProviderManager.init(applicationContext)
         ConfigBackupManager.init(applicationContext)
         ConfigBackupManager.restoreIfNeeded()
+        ConfigManager.init(applicationContext)
+        ProviderManager.init(applicationContext)
+        ConfigBackupManager.ensureBackup()
 
         binding = ActivityMainBinding.inflate(layoutInflater)
         setContentView(binding.root)

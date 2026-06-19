@@ -53,6 +53,18 @@ class ModelRouterServer(port: Int = 8190) : NanoHTTPD(port) {
         .writeTimeout(30, TimeUnit.SECONDS)
         .build()
 
+    /**
+     * 为指定模型创建带 TTFT 超时的流式客户端
+     * readTimeout 设为模型配置的 timeout（秒），用于控制首字节到达前的超时
+     * 一旦流式数据开始返回，OkHttp 的 readTimeout 会在每次 read 成功后重置
+     */
+    private fun createStreamClientForModel(modelId: String): OkHttpClient {
+        val timeoutSec = configManager.getModelTimeout(modelId).toLong()
+        return streamClient.newBuilder()
+            .readTimeout(timeoutSec, TimeUnit.SECONDS)
+            .build()
+    }
+
     private val executor: ExecutorService = ThreadPoolExecutor(
         8,
         128,
@@ -218,7 +230,12 @@ class ModelRouterServer(port: Int = 8190) : NanoHTTPD(port) {
                     if (!isEarlyRateLimit) {
                         if (parsed.has("error")) {
                             StatsManager.recordCall(modelId, false)
-                            return newFixedLengthResponse(Response.Status.OK, "application/json", response)
+                            val errorMsg = parsed.get("error")?.takeIf { it.isJsonObject }?.asJsonObject?.get("message")?.asString ?: "unknown"
+                            val errorType = parsed.get("error")?.takeIf { it.isJsonObject }?.asJsonObject?.get("type")?.asString ?: ""
+                            RouterState.updateModelError(modelId, "上游错误: $errorMsg")
+                            if (RouterState.getLockedModel(group) == modelId) RouterState.unlockGroup(group)
+                            Log.w(TAG, "Non-stream upstream error on model $modelId ($errorType), switching model")
+                            continue
                         }
                         if (!parsed.has("choices")) {
                             StatsManager.recordCall(modelId, false)
@@ -237,9 +254,13 @@ class ModelRouterServer(port: Int = 8190) : NanoHTTPD(port) {
                 StatsManager.recordCall(modelId, true)
                 return newFixedLengthResponse(Response.Status.OK, "application/json", response)
             } catch (e: Exception) {
-                Log.e(TAG, "Non-stream completion error", e)
+                Log.w(TAG, "Non-stream completion error on model $modelId, switching to next model")
                 try { modelId?.let { StatsManager.recordCall(it, false) } } catch (_: Exception) {}
-                return jsonError("api_error", e.message ?: "unknown")
+                if (modelId != null) {
+                    RouterState.updateModelError(modelId, "异常: ${e.message}")
+                    if (RouterState.getLockedModel(group) == modelId) RouterState.unlockGroup(group)
+                }
+                continue
             } finally {
                 if (modelAcquired) modelId?.let { RouterState.releaseModel(it) }
             }
@@ -294,7 +315,7 @@ class ModelRouterServer(port: Int = 8190) : NanoHTTPD(port) {
                         .build()
 
                     try {
-                        val response = streamClient.newCall(request).execute()
+                        val response = createStreamClientForModel(modelId).newCall(request).execute()
                         if (!response.isSuccessful) {
                             val errorBody = response.body?.string() ?: "Unknown error"
                             if (response.code == 429) {
@@ -335,7 +356,9 @@ class ModelRouterServer(port: Int = 8190) : NanoHTTPD(port) {
                             }
                             StatsManager.recordCall(modelId, false)
                             RouterState.updateModelError(modelId, "HTTP ${response.code}")
-                            return jsonError("upstream_error", "Upstream HTTP ${response.code}: ${errorBody.take(100)}")
+                            if (RouterState.getLockedModel(group) == modelId) RouterState.unlockGroup(group)
+                            switchModel = true
+                            break
                         }
                         val responseBody = response.body
                         if (responseBody == null) {
@@ -347,15 +370,19 @@ class ModelRouterServer(port: Int = 8190) : NanoHTTPD(port) {
                         val ttftInputStream = TTFTInputStream(bodyStream, modelId)
                         return newChunkedResponse(Response.Status.OK, "text/event-stream", ttftInputStream)
                     } catch (e: java.net.SocketTimeoutException) {
-                        Log.e(TAG, "Stream timeout error", e)
+                        Log.w(TAG, "Stream timeout on model $modelId, switching to next model")
                         try { StatsManager.recordCall(modelId, false) } catch (_: Exception) {}
                         RouterState.updateModelError(modelId, "超时")
-                        return jsonError("connection_error", "Stream timeout: ${e.message}")
+                        if (RouterState.getLockedModel(group) == modelId) RouterState.unlockGroup(group)
+                        switchModel = true
+                        break
                     } catch (e: Exception) {
-                        Log.e(TAG, "Stream connection error", e)
+                        Log.w(TAG, "Stream connection error on model $modelId, switching to next model")
                         try { StatsManager.recordCall(modelId, false) } catch (_: Exception) {}
                         RouterState.updateModelError(modelId, "连接失败")
-                        return jsonError("connection_error", "Stream connection failed: ${e.message}")
+                        if (RouterState.getLockedModel(group) == modelId) RouterState.unlockGroup(group)
+                        switchModel = true
+                        break
                     }
                 }
             } catch (e: Exception) {
@@ -386,7 +413,7 @@ class ModelRouterServer(port: Int = 8190) : NanoHTTPD(port) {
             }
         } catch (e: Exception) {
             Log.e(TAG, "Anthropic error", e)
-            jsonError("api_error", e.message ?: "unknown")
+            anthropicError("api_error", e.message ?: "unknown")
         }
     }
 
@@ -400,8 +427,8 @@ class ModelRouterServer(port: Int = 8190) : NanoHTTPD(port) {
             try {
                 modelId = if (modelRetry == 0) getModelToUse(chatBody, null)
                           else configManager.selectFastestModel(group)
-                if (modelId == null) return jsonError("api_error", "No model available")
-                if (modelId in triedModelIds) return jsonError("api_error", "No alternative model available")
+                if (modelId == null) return anthropicError("api_error", "No model available")
+                if (modelId in triedModelIds) return anthropicError("api_error", "No alternative model available")
                 triedModelIds.add(modelId)
 
                 RouterState.acquireModel(modelId)
@@ -409,7 +436,7 @@ class ModelRouterServer(port: Int = 8190) : NanoHTTPD(port) {
                 chatBody.addProperty("model", modelId)
                 val providerId = getProviderIdForModel(modelId)
                 val apiKey = providerManager.getNextKey(providerId)
-                if (apiKey.isEmpty()) return jsonError("auth_error", "No API key available for provider $providerId")
+                if (apiKey.isEmpty()) return anthropicError("authentication_error", "No API key available for provider $providerId")
 
                 val sanitizedChatBody = sanitizeRequestBody(chatBody)
                 val chatResponse = forwardToProvider(sanitizedChatBody.toString(), apiKey, providerId)
@@ -435,32 +462,40 @@ class ModelRouterServer(port: Int = 8190) : NanoHTTPD(port) {
                     JsonParser.parseString(chatResponse).asJsonObject
                 } catch (e: Exception) {
                     Log.e(TAG, "Failed to parse upstream response as JSON", e)
-                    return jsonError("api_error", "Invalid response from upstream: not valid JSON")
+                    return anthropicError("api_error", "Invalid response from upstream: not valid JSON")
                 }
 
                 if (responseObj.has("error")) {
                     StatsManager.recordCall(modelId, false)
-                    return newFixedLengthResponse(Response.Status.OK, "application/json", chatResponse)
+                    val errorMsg = responseObj.get("error")?.takeIf { it.isJsonObject }?.asJsonObject?.get("message")?.asString ?: "unknown"
+                    RouterState.updateModelError(modelId, "上游错误: $errorMsg")
+                    if (RouterState.getLockedModel(group) == modelId) RouterState.unlockGroup(group)
+                    Log.w(TAG, "Anthropic non-stream upstream error on model $modelId, switching model")
+                    continue
                 }
 
                 val choices = responseObj.get("choices")?.takeIf { it.isJsonArray }?.asJsonArray
                 if (choices == null || choices.size() == 0) {
                     StatsManager.recordCall(modelId, false)
-                    return jsonError("api_error", "No choices in upstream response")
+                    return anthropicError("api_error", "No choices in upstream response")
                 }
 
                 val anthropicResponse = ProtocolConverter.openAIToAnthropicResponse(responseObj, model)
                 StatsManager.recordCall(modelId, true)
                 newFixedLengthResponse(Response.Status.OK, "application/json", gson.toJson(anthropicResponse))
             } catch (e: Exception) {
-                Log.e(TAG, "Anthropic non-stream error", e)
+                Log.w(TAG, "Anthropic non-stream error on model $modelId, switching to next model")
                 try { modelId?.let { StatsManager.recordCall(it, false) } } catch (_: Exception) {}
-                jsonError("api_error", e.message ?: "unknown")
+                if (modelId != null) {
+                    RouterState.updateModelError(modelId, "异常: ${e.message}")
+                    if (RouterState.getLockedModel(group) == modelId) RouterState.unlockGroup(group)
+                }
+                continue
             } finally {
                 if (modelAcquired) modelId?.let { RouterState.releaseModel(it) }
             }
         }
-        return jsonError("api_error", "No model available after early rate limit")
+        return anthropicError("api_error", "No model available after early rate limit")
     }
 
     private fun handleAnthropicStream(chatBody: JsonObject, model: String, @Suppress("UNUSED_PARAMETER") originalBody: JsonObject): Response {
@@ -470,8 +505,8 @@ class ModelRouterServer(port: Int = 8190) : NanoHTTPD(port) {
         for (modelRetry in 0..2) {
             val modelId = if (modelRetry == 0) getModelToUse(chatBody, null)
                           else configManager.selectFastestModel(group)
-            if (modelId == null) return jsonError("api_error", "No model available")
-            if (modelId in triedModelIds) return jsonError("api_error", "No alternative model available")
+            if (modelId == null) return anthropicError("api_error", "No model available")
+            if (modelId in triedModelIds) return anthropicError("api_error", "No alternative model available")
             triedModelIds.add(modelId)
 
             var modelAcquired = false
@@ -485,7 +520,7 @@ class ModelRouterServer(port: Int = 8190) : NanoHTTPD(port) {
                 val providerId = getProviderIdForModel(modelId)
                 val apiKey = providerManager.getNextKey(providerId)
                 if (apiKey.isEmpty()) {
-                    return jsonError("auth_error", "No API key available for provider $providerId")
+                    return anthropicError("authentication_error", "No API key available for provider $providerId")
                 }
 
                 val baseUrl = providerManager.getProvider(providerId)?.baseUrl ?: Constants.DEFAULT_BASE_URL
@@ -507,7 +542,7 @@ class ModelRouterServer(port: Int = 8190) : NanoHTTPD(port) {
                         .build()
 
                     try {
-                        val response = streamClient.newCall(request).execute()
+                        val response = createStreamClientForModel(modelId).newCall(request).execute()
                         if (!response.isSuccessful) {
                             val errorBody = response.body?.string() ?: "Unknown error"
                             if (response.code == 429) {
@@ -548,12 +583,14 @@ class ModelRouterServer(port: Int = 8190) : NanoHTTPD(port) {
                             }
                             StatsManager.recordCall(modelId, false)
                             RouterState.updateModelError(modelId, "HTTP ${response.code}")
-                            return jsonError("upstream_error", "Upstream HTTP ${response.code}: ${errorBody.take(100)}")
+                            if (RouterState.getLockedModel(group) == modelId) RouterState.unlockGroup(group)
+                            switchModel = true
+                            break
                         }
 
                         val responseBody = response.body
                         if (responseBody == null) {
-                            return jsonError("api_error", "Empty stream response from upstream")
+                            return anthropicError("api_error", "Empty stream response from upstream")
                         }
                         val inputStream = responseBody.byteStream()
 
@@ -585,25 +622,29 @@ class ModelRouterServer(port: Int = 8190) : NanoHTTPD(port) {
                             try { responseBody.close() } catch (_: Exception) {}
                             RouterState.releaseModel(modelId)
                             modelAcquired = false
-                            return jsonError("server_overloaded", "Server under heavy load, please retry")
+                            return anthropicError("overloaded_error", "Server under heavy load, please retry")
                         }
 
                         return newChunkedResponse(Response.Status.OK, "text/event-stream", pipeIn)
                     } catch (e: java.net.SocketTimeoutException) {
-                        Log.e(TAG, "Anthropic stream timeout error", e)
+                        Log.w(TAG, "Anthropic stream timeout on model $modelId, switching to next model")
                         try { StatsManager.recordCall(modelId, false) } catch (_: Exception) {}
                         RouterState.updateModelError(modelId, "超时")
-                        return jsonError("connection_error", "Stream timeout: ${e.message}")
+                        if (RouterState.getLockedModel(group) == modelId) RouterState.unlockGroup(group)
+                        switchModel = true
+                        break
                     } catch (e: Exception) {
-                        Log.e(TAG, "Anthropic stream connection error", e)
+                        Log.w(TAG, "Anthropic stream connection error on model $modelId, switching to next model")
                         try { StatsManager.recordCall(modelId, false) } catch (_: Exception) {}
                         RouterState.updateModelError(modelId, "连接失败")
-                        return jsonError("connection_error", "Stream connection failed: ${e.message}")
+                        if (RouterState.getLockedModel(group) == modelId) RouterState.unlockGroup(group)
+                        switchModel = true
+                        break
                     }
                 }
             } catch (e: Exception) {
                 Log.e(TAG, "Anthropic stream outer error", e)
-                return jsonError("api_error", e.message ?: "unknown")
+                return anthropicError("api_error", e.message ?: "unknown")
             } finally {
                 if (modelAcquired) RouterState.releaseModel(modelId)
             }
@@ -611,7 +652,7 @@ class ModelRouterServer(port: Int = 8190) : NanoHTTPD(port) {
             if (switchModel) continue
         }
 
-        return jsonError("api_error", "No model available after early rate limit")
+        return anthropicError("api_error", "No model available after early rate limit")
     }
 
     private fun writeAnthropicStreamEvents(messageId: String, model: String, inputStream: InputStream, outputStream: PipedOutputStream) {
@@ -1355,6 +1396,40 @@ class ModelRouterServer(port: Int = 8190) : NanoHTTPD(port) {
     private fun jsonError(type: String, message: String): Response {
         return newFixedLengthResponse(Response.Status.INTERNAL_ERROR, "application/json",
             gson.toJson(mapOf("error" to mapOf("message" to message, "type" to type))))
+    }
+
+    /**
+     * Anthropic 格式错误响应
+     * 格式: {"type": "error", "error": {"type": "...", "message": "..."}}
+     * HTTP 状态码根据错误类型映射
+     */
+    private fun anthropicError(type: String, message: String): Response {
+        val status = when (type) {
+            "authentication_error" -> Response.Status.UNAUTHORIZED
+            "permission_error" -> Response.Status.FORBIDDEN
+            "not_found_error" -> Response.Status.NOT_FOUND
+            "rate_limit_error" -> Response.Status.INTERNAL_ERROR
+            "invalid_request_error" -> Response.Status.BAD_REQUEST
+            "overloaded_error" -> Response.Status.SERVICE_UNAVAILABLE
+            "timeout_error" -> Response.Status.SERVICE_UNAVAILABLE
+            else -> Response.Status.INTERNAL_ERROR
+        }
+        return newFixedLengthResponse(status, "application/json",
+            gson.toJson(mapOf("type" to "error", "error" to mapOf("type" to type, "message" to message))))
+    }
+
+    /**
+     * 将内部错误类型映射为 Anthropic 错误类型
+     */
+    private fun mapToAnthropicErrorType(internalType: String): String {
+        return when (internalType) {
+            "auth_error" -> "authentication_error"
+            "upstream_error" -> "api_error"
+            "connection_error" -> "timeout_error"
+            "server_overloaded" -> "overloaded_error"
+            "bad_request" -> "invalid_request_error"
+            else -> "api_error"
+        }
     }
 
     private data class ToolCallState(var id: String, var name: String)

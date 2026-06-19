@@ -39,11 +39,19 @@ object ConfigBackupManager {
         appContext = context.applicationContext
     }
 
+    /**
+     * 在所有 Manager 初始化完成后调用，确保配置被备份
+     */
+    fun ensureBackup() {
+        backupAll()
+    }
+
     private fun getBackupDir(): File {
-        // /sdcard/Android/media/<package>/ - 卸载后不会被删除
-        return File(appContext.getExternalFilesDir(null)?.parentFile?.parentFile?.parentFile?.parentFile,
-            "media/${appContext.packageName}/$BACKUP_DIR"
-        ).also { it.mkdirs() }
+        // 使用 getExternalMediaDirs()，返回 /sdcard/Android/media/<package>/
+        // 不需要存储权限，且卸载后不会被删除
+        val mediaDir = appContext.externalMediaDirs.firstOrNull()
+            ?: File("/sdcard/Android/media/${appContext.packageName}")
+        return File(mediaDir, BACKUP_DIR).also { it.mkdirs() }
     }
 
     // ===== 备份 =====

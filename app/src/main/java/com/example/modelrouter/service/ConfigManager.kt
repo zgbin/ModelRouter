@@ -56,6 +56,10 @@ object ConfigManager {
         return getGroups().find { it.port == port }?.name ?: "综合对话组"
     }
 
+    fun getModelTimeout(modelId: String): Int {
+        return getGroups().flatMap { it.models }.find { it.id == modelId }?.timeout ?: 60
+    }
+
     fun selectFastestModel(groupName: String): String? {
         val group = getGroups().find { it.name == groupName && it.enabled } ?: return null
         val enabledModels = group.models.filter { it.enabled }

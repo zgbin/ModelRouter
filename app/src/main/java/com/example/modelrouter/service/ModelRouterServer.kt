@@ -26,12 +26,15 @@ import java.io.OutputStreamWriter
 import java.io.PipedInputStream
 import java.io.PipedOutputStream
 import java.util.HashMap
+import java.util.concurrent.CompletableFuture
+import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.ExecutorService
 import java.util.concurrent.LinkedBlockingQueue
 import java.util.concurrent.SynchronousQueue
 import java.util.concurrent.ThreadPoolExecutor
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicInteger
+import java.util.concurrent.atomic.AtomicReference
 
 class ModelRouterServer(port: Int = 8190) : NanoHTTPD(port) {
 
@@ -83,6 +86,32 @@ class ModelRouterServer(port: Int = 8190) : NanoHTTPD(port) {
         ThreadPoolExecutor.CallerRunsPolicy()
     )
 
+    // 健康检测专用执行器（指数退避检测出错模型）
+    private val healthCheckExecutor: ExecutorService = ThreadPoolExecutor(
+        2,
+        16,
+        60L,
+        TimeUnit.SECONDS,
+        LinkedBlockingQueue(128),
+        ThreadPoolExecutor.CallerRunsPolicy()
+    )
+
+    // 慢响应并行请求执行器
+    private val parallelRequestExecutor: ExecutorService = ThreadPoolExecutor(
+        4,
+        32,
+        60L,
+        TimeUnit.SECONDS,
+        LinkedBlockingQueue(256),
+        ThreadPoolExecutor.CallerRunsPolicy()
+    )
+
+    companion object {
+        private const val TAG = "ModelRouterServer"
+        private const val SLOW_RESPONSE_TIMEOUT_MS = 30_000L
+        private const val MAX_PARALLEL_ATTEMPTS = 5
+    }
+
     init {
         setAsyncRunner(object : AsyncRunner {
             override fun exec(code: NanoHTTPD.ClientHandler) {
@@ -94,6 +123,8 @@ class ModelRouterServer(port: Int = 8190) : NanoHTTPD(port) {
             override fun closeAll() {
                 executor.shutdownNow()
                 streamPipeExecutor.shutdownNow()
+                healthCheckExecutor.shutdownNow()
+                parallelRequestExecutor.shutdownNow()
             }
         })
     }
@@ -103,10 +134,6 @@ class ModelRouterServer(port: Int = 8190) : NanoHTTPD(port) {
     private val providerManager = ProviderManager
     private val speedTester = SpeedTester(client, keyManager)
     private val speedTestScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
-
-    companion object {
-        private const val TAG = "ModelRouterServer"
-    }
 
     override fun stop() {
         try {
@@ -132,6 +159,12 @@ class ModelRouterServer(port: Int = 8190) : NanoHTTPD(port) {
             if (!streamPipeExecutor.awaitTermination(5, TimeUnit.SECONDS)) {
                 streamPipeExecutor.shutdownNow()
             }
+        } catch (_: Exception) {}
+        try {
+            healthCheckExecutor.shutdownNow()
+        } catch (_: Exception) {}
+        try {
+            parallelRequestExecutor.shutdownNow()
         } catch (_: Exception) {}
         super.stop()
         Log.i(TAG, "ModelRouterServer on port $listeningPort stopped and resources released")
@@ -195,77 +228,13 @@ class ModelRouterServer(port: Int = 8190) : NanoHTTPD(port) {
 
     private fun handleNonStreamCompletion(jsonBody: JsonObject, groupName: String?): Response {
         val group = groupName ?: configManager.getGroupByPort(listeningPort)
-        val triedModelIds = mutableSetOf<String>()
 
-        for (modelRetry in 0..2) {
-            var modelId: String? = null
-            var modelAcquired = false
-            try {
-                modelId = if (modelRetry == 0) getModelToUse(jsonBody, group)
-                          else configManager.selectFastestModel(group)
-                if (modelId == null) return jsonError("api_error", "No model available")
-                if (modelId in triedModelIds) return jsonError("api_error", "No alternative model available")
-                triedModelIds.add(modelId)
+        // 首次获取模型，使用慢响应并行处理机制
+        val firstModelId = getModelToUse(jsonBody, group)
+        if (firstModelId == null) return jsonError("api_error", "No model available")
 
-                RouterState.acquireModel(modelId)
-                modelAcquired = true
-                jsonBody.addProperty("model", modelId)
-                jsonBody.remove("group")
-
-                val providerId = getProviderIdForModel(modelId)
-                val apiKey = providerManager.getNextKey(providerId)
-                if (apiKey.isEmpty()) return jsonError("auth_error", "No API key available for provider $providerId")
-
-                val sanitizedBody = sanitizeRequestBody(jsonBody)
-                val response = forwardToProvider(sanitizedBody.toString(), apiKey, providerId)
-
-                var isEarlyRateLimit = false
-                try {
-                    val parsed = JsonParser.parseString(response).asJsonObject
-                    val error = parsed.get("error")
-                    if (error != null && error.isJsonObject) {
-                        val errorType = error.asJsonObject.get("type")?.asString
-                        if (errorType == "early_rate_limit") isEarlyRateLimit = true
-                    }
-                    if (!isEarlyRateLimit) {
-                        if (parsed.has("error")) {
-                            StatsManager.recordCall(modelId, false)
-                            val errorMsg = parsed.get("error")?.takeIf { it.isJsonObject }?.asJsonObject?.get("message")?.asString ?: "unknown"
-                            val errorType = parsed.get("error")?.takeIf { it.isJsonObject }?.asJsonObject?.get("type")?.asString ?: ""
-                            RouterState.updateModelError(modelId, "上游错误: $errorMsg")
-                            if (RouterState.getLockedModel(group) == modelId) RouterState.unlockGroup(group)
-                            Log.w(TAG, "Non-stream upstream error on model $modelId ($errorType), switching model")
-                            continue
-                        }
-                        if (!parsed.has("choices")) {
-                            StatsManager.recordCall(modelId, false)
-                            return jsonError("api_error", "Invalid response format from upstream: missing choices")
-                        }
-                    }
-                } catch (_: Exception) {}
-
-                if (isEarlyRateLimit) {
-                    RouterState.updateModelError(modelId, "429 限流")
-                    if (RouterState.getLockedModel(group) == modelId) RouterState.unlockGroup(group)
-                    Log.w(TAG, "Early 429 on model $modelId, switching model (retry ${modelRetry + 1})")
-                    continue
-                }
-
-                StatsManager.recordCall(modelId, true)
-                return newFixedLengthResponse(Response.Status.OK, "application/json", response)
-            } catch (e: Exception) {
-                Log.w(TAG, "Non-stream completion error on model $modelId, switching to next model")
-                try { modelId?.let { StatsManager.recordCall(it, false) } } catch (_: Exception) {}
-                if (modelId != null) {
-                    RouterState.updateModelError(modelId, "异常: ${e.message}")
-                    if (RouterState.getLockedModel(group) == modelId) RouterState.unlockGroup(group)
-                }
-                continue
-            } finally {
-                if (modelAcquired) modelId?.let { RouterState.releaseModel(it) }
-            }
-        }
-        return jsonError("api_error", "No model available after early rate limit")
+        // 使用慢响应并行处理：30秒未返回则切换下一个模型，最多5次
+        return handleSlowResponseWithParallel(jsonBody, group, firstModelId)
     }
 
     private fun handleStreamCompletion(jsonBody: JsonObject, groupName: String?): Response {
@@ -320,22 +289,26 @@ class ModelRouterServer(port: Int = 8190) : NanoHTTPD(port) {
                             val errorBody = response.body?.string() ?: "Unknown error"
                             if (response.code == 429) {
                                 if (providerManager.isEarly429(providerId, currentApiKey)) {
-                                    RouterState.updateModelError(modelId, "429 限流")
-                                    if (RouterState.getLockedModel(group) == modelId) RouterState.unlockGroup(group)
-                                    Log.w(TAG, "Stream early 429 on model $modelId, switching model")
+                                    // Early 429：解锁分组 + 切换模型 + 启动健康检测
+                                    Log.w(TAG, "Stream early 429 on model $modelId, unlocking and switching model")
+                                    handleModelErrorAndSwitch(modelId, group, "early_429", "429 限流")
                                     switchModel = true
                                     break
                                 }
+                                // 普通429：保持锁定 + 切换API KEY重试
                                 if (attempt <= maxRetries) {
                                     val newKey = providerManager.peekNextKey(providerId, currentApiKey)
                                     if (newKey.isNotEmpty() && newKey != currentApiKey) {
                                         currentApiKey = newKey
-                                        Log.w(TAG, "Stream 429, retry $attempt with different key")
+                                        Log.w(TAG, "Stream normal 429, keeping lock, retry $attempt with different key")
                                         continue
                                     }
                                     val delay = (500L * attempt)
                                     if (totalSleepMs + delay > maxTotalSleepMs) {
-                                        Log.w(TAG, "Stream 429, total sleep limit reached, giving up")
+                                        Log.w(TAG, "Stream 429, total sleep limit reached, switching model")
+                                        // 达到重试上限，解锁 + 切换模型 + 健康检测
+                                        handleModelErrorAndSwitch(modelId, group, "429_limit", "429 限流重试耗尽")
+                                        switchModel = true
                                         break
                                     }
                                     totalSleepMs += delay
@@ -343,6 +316,10 @@ class ModelRouterServer(port: Int = 8190) : NanoHTTPD(port) {
                                     Thread.sleep(delay)
                                     continue
                                 }
+                                // 重试次数用完，解锁 + 切换模型 + 健康检测
+                                handleModelErrorAndSwitch(modelId, group, "429_limit", "429 限流重试耗尽")
+                                switchModel = true
+                                break
                             }
                             if (response.code == 400) {
                                 Log.w(TAG, "Stream 400 error from $providerId: ${errorBody.take(300)}")
@@ -355,14 +332,17 @@ class ModelRouterServer(port: Int = 8190) : NanoHTTPD(port) {
                                 Log.w(TAG, "Stream upstream error HTTP ${response.code}: ${errorBody.take(200)}")
                             }
                             StatsManager.recordCall(modelId, false)
-                            RouterState.updateModelError(modelId, "HTTP ${response.code}")
-                            if (RouterState.getLockedModel(group) == modelId) RouterState.unlockGroup(group)
+                            // 其他HTTP错误：解锁分组 + 切换模型 + 启动健康检测
+                            handleModelErrorAndSwitch(modelId, group, "http_${response.code}", "HTTP ${response.code}")
                             switchModel = true
                             break
                         }
                         val responseBody = response.body
                         if (responseBody == null) {
-                            return jsonError("api_error", "Empty stream response from upstream")
+                            // 空响应：解锁分组 + 切换模型 + 启动健康检测
+                            handleModelErrorAndSwitch(modelId, group, "empty_response", "空响应")
+                            switchModel = true
+                            break
                         }
                         val bodyStream = responseBody.byteStream()
                         StatsManager.recordCall(modelId, true)
@@ -372,15 +352,15 @@ class ModelRouterServer(port: Int = 8190) : NanoHTTPD(port) {
                     } catch (e: java.net.SocketTimeoutException) {
                         Log.w(TAG, "Stream timeout on model $modelId, switching to next model")
                         try { StatsManager.recordCall(modelId, false) } catch (_: Exception) {}
-                        RouterState.updateModelError(modelId, "超时")
-                        if (RouterState.getLockedModel(group) == modelId) RouterState.unlockGroup(group)
+                        // 超时：解锁分组 + 切换模型 + 启动健康检测
+                        handleModelErrorAndSwitch(modelId, group, "timeout", "超时")
                         switchModel = true
                         break
                     } catch (e: Exception) {
                         Log.w(TAG, "Stream connection error on model $modelId, switching to next model")
                         try { StatsManager.recordCall(modelId, false) } catch (_: Exception) {}
-                        RouterState.updateModelError(modelId, "连接失败")
-                        if (RouterState.getLockedModel(group) == modelId) RouterState.unlockGroup(group)
+                        // 连接失败：解锁分组 + 切换模型 + 启动健康检测
+                        handleModelErrorAndSwitch(modelId, group, "connection_error", "连接失败")
                         switchModel = true
                         break
                     }
@@ -442,19 +422,28 @@ class ModelRouterServer(port: Int = 8190) : NanoHTTPD(port) {
                 val chatResponse = forwardToProvider(sanitizedChatBody.toString(), apiKey, providerId)
 
                 var isEarlyRateLimit = false
+                var isNormalRateLimit = false
                 try {
                     val checkParsed = JsonParser.parseString(chatResponse).asJsonObject
                     val checkError = checkParsed.get("error")
                     if (checkError != null && checkError.isJsonObject) {
                         val errorType = checkError.asJsonObject.get("type")?.asString
                         if (errorType == "early_rate_limit") isEarlyRateLimit = true
+                        if (errorType == "rate_limit_error") isNormalRateLimit = true
                     }
                 } catch (_: Exception) {}
 
+                // 普通429：保持锁定 + 切换API KEY重试（forwardToProvider内部已处理）
+                if (isNormalRateLimit) {
+                    Log.w(TAG, "Anthropic non-stream normal 429 on model $modelId, keeping lock")
+                    StatsManager.recordCall(modelId, false)
+                    return newFixedLengthResponse(Response.Status.OK, "application/json", chatResponse)
+                }
+
+                // Early 429：解锁分组 + 切换模型 + 启动健康检测
                 if (isEarlyRateLimit) {
-                    RouterState.updateModelError(modelId, "429 限流")
-                    if (RouterState.getLockedModel(group) == modelId) RouterState.unlockGroup(group)
-                    Log.w(TAG, "Anthropic non-stream early 429 on model $modelId, switching model")
+                    Log.w(TAG, "Anthropic non-stream early 429 on model $modelId, unlocking and switching model")
+                    handleModelErrorAndSwitch(modelId, group, "early_429", "429 限流")
                     continue
                 }
 
@@ -462,22 +451,25 @@ class ModelRouterServer(port: Int = 8190) : NanoHTTPD(port) {
                     JsonParser.parseString(chatResponse).asJsonObject
                 } catch (e: Exception) {
                     Log.e(TAG, "Failed to parse upstream response as JSON", e)
-                    return anthropicError("api_error", "Invalid response from upstream: not valid JSON")
+                    // JSON解析失败：解锁分组 + 切换模型 + 启动健康检测
+                    handleModelErrorAndSwitch(modelId, group, "parse_error", "响应解析失败")
+                    continue
                 }
 
                 if (responseObj.has("error")) {
+                    // 其他错误：解锁分组 + 切换模型 + 启动健康检测
+                    Log.w(TAG, "Anthropic non-stream error on model $modelId, unlocking and switching model")
+                    handleModelErrorAndSwitch(modelId, group, "api_error", "API错误")
                     StatsManager.recordCall(modelId, false)
-                    val errorMsg = responseObj.get("error")?.takeIf { it.isJsonObject }?.asJsonObject?.get("message")?.asString ?: "unknown"
-                    RouterState.updateModelError(modelId, "上游错误: $errorMsg")
-                    if (RouterState.getLockedModel(group) == modelId) RouterState.unlockGroup(group)
-                    Log.w(TAG, "Anthropic non-stream upstream error on model $modelId, switching model")
                     continue
                 }
 
                 val choices = responseObj.get("choices")?.takeIf { it.isJsonArray }?.asJsonArray
                 if (choices == null || choices.size() == 0) {
                     StatsManager.recordCall(modelId, false)
-                    return anthropicError("api_error", "No choices in upstream response")
+                    // 无choices：解锁分组 + 切换模型 + 启动健康检测
+                    handleModelErrorAndSwitch(modelId, group, "no_choices", "无choices返回")
+                    continue
                 }
 
                 val anthropicResponse = ProtocolConverter.openAIToAnthropicResponse(responseObj, model)
@@ -487,8 +479,7 @@ class ModelRouterServer(port: Int = 8190) : NanoHTTPD(port) {
                 Log.w(TAG, "Anthropic non-stream error on model $modelId, switching to next model")
                 try { modelId?.let { StatsManager.recordCall(it, false) } } catch (_: Exception) {}
                 if (modelId != null) {
-                    RouterState.updateModelError(modelId, "异常: ${e.message}")
-                    if (RouterState.getLockedModel(group) == modelId) RouterState.unlockGroup(group)
+                    handleModelErrorAndSwitch(modelId, group, "exception", "异常: ${e.message}")
                 }
                 continue
             } finally {
@@ -547,22 +538,26 @@ class ModelRouterServer(port: Int = 8190) : NanoHTTPD(port) {
                             val errorBody = response.body?.string() ?: "Unknown error"
                             if (response.code == 429) {
                                 if (providerManager.isEarly429(providerId, currentApiKey)) {
-                                    RouterState.updateModelError(modelId, "429 限流")
-                                    if (RouterState.getLockedModel(group) == modelId) RouterState.unlockGroup(group)
-                                    Log.w(TAG, "Anthropic stream early 429 on model $modelId, switching model")
+                                    // Early 429：解锁分组 + 切换模型 + 启动健康检测
+                                    Log.w(TAG, "Anthropic stream early 429 on model $modelId, unlocking and switching model")
+                                    handleModelErrorAndSwitch(modelId, group, "early_429", "429 限流")
                                     switchModel = true
                                     break
                                 }
+                                // 普通429：保持锁定 + 切换API KEY重试
                                 if (attempt <= maxRetries) {
                                     val newKey = providerManager.peekNextKey(providerId, currentApiKey)
                                     if (newKey.isNotEmpty() && newKey != currentApiKey) {
                                         currentApiKey = newKey
-                                        Log.w(TAG, "Anthropic stream 429, retry $attempt with different key")
+                                        Log.w(TAG, "Anthropic stream normal 429, keeping lock, retry $attempt with different key")
                                         continue
                                     }
                                     val delay = (500L * attempt)
                                     if (totalSleepMs + delay > maxTotalSleepMs) {
-                                        Log.w(TAG, "Anthropic stream 429, total sleep limit reached, giving up")
+                                        Log.w(TAG, "Anthropic stream 429, total sleep limit reached, switching model")
+                                        // 达到重试上限，解锁 + 切换模型 + 健康检测
+                                        handleModelErrorAndSwitch(modelId, group, "429_limit", "429 限流重试耗尽")
+                                        switchModel = true
                                         break
                                     }
                                     totalSleepMs += delay
@@ -570,6 +565,10 @@ class ModelRouterServer(port: Int = 8190) : NanoHTTPD(port) {
                                     Thread.sleep(delay)
                                     continue
                                 }
+                                // 重试次数用完，解锁 + 切换模型 + 健康检测
+                                handleModelErrorAndSwitch(modelId, group, "429_limit", "429 限流重试耗尽")
+                                switchModel = true
+                                break
                             }
                             if (response.code == 400) {
                                 Log.w(TAG, "Anthropic stream 400 from $providerId: ${errorBody.take(300)}")
@@ -582,15 +581,18 @@ class ModelRouterServer(port: Int = 8190) : NanoHTTPD(port) {
                                 Log.w(TAG, "Anthropic stream upstream error HTTP ${response.code}: ${errorBody.take(200)}")
                             }
                             StatsManager.recordCall(modelId, false)
-                            RouterState.updateModelError(modelId, "HTTP ${response.code}")
-                            if (RouterState.getLockedModel(group) == modelId) RouterState.unlockGroup(group)
+                            // 其他HTTP错误：解锁分组 + 切换模型 + 启动健康检测
+                            handleModelErrorAndSwitch(modelId, group, "http_${response.code}", "HTTP ${response.code}")
                             switchModel = true
                             break
                         }
 
                         val responseBody = response.body
                         if (responseBody == null) {
-                            return anthropicError("api_error", "Empty stream response from upstream")
+                            // 空响应：解锁分组 + 切换模型 + 启动健康检测
+                            handleModelErrorAndSwitch(modelId, group, "empty_response", "空响应")
+                            switchModel = true
+                            break
                         }
                         val inputStream = responseBody.byteStream()
 
@@ -629,15 +631,15 @@ class ModelRouterServer(port: Int = 8190) : NanoHTTPD(port) {
                     } catch (e: java.net.SocketTimeoutException) {
                         Log.w(TAG, "Anthropic stream timeout on model $modelId, switching to next model")
                         try { StatsManager.recordCall(modelId, false) } catch (_: Exception) {}
-                        RouterState.updateModelError(modelId, "超时")
-                        if (RouterState.getLockedModel(group) == modelId) RouterState.unlockGroup(group)
+                        // 超时：解锁分组 + 切换模型 + 启动健康检测
+                        handleModelErrorAndSwitch(modelId, group, "timeout", "超时")
                         switchModel = true
                         break
                     } catch (e: Exception) {
                         Log.w(TAG, "Anthropic stream connection error on model $modelId, switching to next model")
                         try { StatsManager.recordCall(modelId, false) } catch (_: Exception) {}
-                        RouterState.updateModelError(modelId, "连接失败")
-                        if (RouterState.getLockedModel(group) == modelId) RouterState.unlockGroup(group)
+                        // 连接失败：解锁分组 + 切换模型 + 启动健康检测
+                        handleModelErrorAndSwitch(modelId, group, "connection_error", "连接失败")
                         switchModel = true
                         break
                     }
@@ -928,6 +930,292 @@ class ModelRouterServer(port: Int = 8190) : NanoHTTPD(port) {
         val lockedModel = RouterState.getLockedModel(group)
         if (lockedModel != null) return lockedModel
         return configManager.selectFastestModel(group)
+    }
+
+    /**
+     * 启动指数退避健康检测任务，持续检测出错模型是否恢复
+     * 恢复后停止检测，如果之前是锁定状态则恢复锁定
+     */
+    private fun startHealthCheckWithBackoff(modelId: String, groupName: String, wasLocked: Boolean, errorType: String) {
+        // 如果已经有健康检测在运行，不重复启动
+        if (RouterState.isHealthCheckRunning(modelId)) {
+            Log.d(TAG, "Health check already running for model $modelId, skip")
+            return
+        }
+
+        val healthInfo = RouterState.startHealthCheck(modelId, groupName, wasLocked, errorType)
+        Log.i(TAG, "Starting health check for model $modelId (wasLocked=$wasLocked, error=$errorType)")
+
+        healthCheckExecutor.execute {
+            var backoffMs = 5000L  // 初始退避5秒
+            val maxBackoffMs = 300_000L  // 最大退避5分钟
+            val healthCheckClient = OkHttpClient.Builder()
+                .connectionPool(connectionPool)
+                .connectTimeout(10, TimeUnit.SECONDS)
+                .readTimeout(30, TimeUnit.SECONDS)
+                .writeTimeout(10, TimeUnit.SECONDS)
+                .build()
+
+            while (healthInfo.running) {
+                try {
+                    Thread.sleep(backoffMs)
+                } catch (_: InterruptedException) {
+                    break
+                }
+
+                if (!healthInfo.running) break
+
+                try {
+                    val providerId = getProviderIdForModel(modelId)
+                    val provider = providerManager.getProvider(providerId)
+                    val baseUrl = provider?.baseUrl ?: Constants.DEFAULT_BASE_URL
+                    val apiKey = providerManager.getNextKey(providerId)
+
+                    if (apiKey.isEmpty()) {
+                        Log.w(TAG, "Health check for $modelId: no API key, retry later")
+                        backoffMs = minOf(backoffMs * 2, maxBackoffMs)
+                        continue
+                    }
+
+                    // 发送一个简单的健康检测请求
+                    val healthCheckBody = JsonObject().apply {
+                        addProperty("model", modelId)
+                        add("messages", com.google.gson.JsonArray().apply {
+                            add(JsonObject().apply {
+                                addProperty("role", "user")
+                                addProperty("content", "hi")
+                            })
+                        })
+                        addProperty("max_tokens", 1)
+                        addProperty("stream", false)
+                    }
+
+                    val request = Request.Builder()
+                        .url("${baseUrl.trimEnd('/')}/chat/completions")
+                        .header("Authorization", "Bearer $apiKey")
+                        .header("Content-Type", "application/json")
+                        .post(healthCheckBody.toString().toRequestBody("application/json; charset=utf-8".toMediaType()))
+                        .build()
+
+                    val response = healthCheckClient.newCall(request).execute()
+                    val isSuccess = response.isSuccessful
+                    response.body?.close()
+
+                    if (isSuccess) {
+                        Log.i(TAG, "Health check PASSED for model $modelId, marking as recovered")
+                        RouterState.finishHealthCheck(modelId)
+                        break
+                    } else {
+                        Log.w(TAG, "Health check FAILED for model $modelId, HTTP ${response.code}, next backoff ${backoffMs * 2}ms")
+                    }
+                } catch (e: Exception) {
+                    Log.w(TAG, "Health check error for model $modelId: ${e.message}, next backoff ${backoffMs * 2}ms")
+                }
+
+                // 指数退避
+                backoffMs = minOf(backoffMs * 2, maxBackoffMs)
+            }
+        }
+    }
+
+    /**
+     * 处理非锁定错误：解锁分组 + 切换模型 + 启动健康检测
+     * @return true 表示已处理并应切换模型，false 表示不应切换
+     */
+    private fun handleModelErrorAndSwitch(modelId: String, group: String, errorType: String, errorMsg: String): Boolean {
+        val wasLocked = RouterState.getLockedModel(group) == modelId
+        RouterState.updateModelError(modelId, errorMsg)
+        if (wasLocked) {
+            RouterState.unlockGroup(group)
+        }
+        // 启动指数退避健康检测
+        startHealthCheckWithBackoff(modelId, group, wasLocked, errorType)
+        return true
+    }
+
+    /**
+     * 慢响应并行请求处理：超过30秒未返回则将请求同步发送给下一个大模型
+     * 最多重复5次，只要有一个成功返回就停止，只把第一个成功的返回给调用者
+     */
+    private data class ParallelRequestResult(
+        val success: Boolean,
+        val response: String?,
+        val modelId: String,
+        val error: String? = null
+    )
+
+    /**
+     * 执行单个模型请求（带超时控制），用于并行请求
+     */
+    private fun executeModelRequest(
+        body: JsonObject,
+        modelId: String,
+        timeoutMs: Long
+    ): ParallelRequestResult {
+        return try {
+            val providerId = getProviderIdForModel(modelId)
+            val apiKey = providerManager.getNextKey(providerId)
+            if (apiKey.isEmpty()) {
+                return ParallelRequestResult(false, null, modelId, "No API key for provider $providerId")
+            }
+
+            val baseUrl = providerManager.getProvider(providerId)?.baseUrl ?: Constants.DEFAULT_BASE_URL
+            val requestBody = body.deepCopy()
+            requestBody.addProperty("model", modelId)
+            requestBody.remove("group")
+            val sanitizedBody = sanitizeRequestBody(requestBody)
+
+            val parallelClient = OkHttpClient.Builder()
+                .connectionPool(connectionPool)
+                .connectTimeout(10, TimeUnit.SECONDS)
+                .readTimeout(timeoutMs, TimeUnit.MILLISECONDS)
+                .writeTimeout(10, TimeUnit.SECONDS)
+                .build()
+
+            val request = Request.Builder()
+                .url("${baseUrl.trimEnd('/')}/chat/completions")
+                .header("Authorization", "Bearer $apiKey")
+                .header("Content-Type", "application/json")
+                .post(sanitizedBody.toString().toRequestBody("application/json; charset=utf-8".toMediaType()))
+                .build()
+
+            RouterState.acquireModel(modelId)
+            try {
+                val response = parallelClient.newCall(request).execute()
+                val responseBody = response.body?.string()
+                if (response.isSuccessful && !responseBody.isNullOrEmpty()) {
+                    // 验证响应是否包含choices
+                    try {
+                        val parsed = JsonParser.parseString(responseBody).asJsonObject
+                        if (!parsed.has("error") && parsed.has("choices")) {
+                            StatsManager.recordCall(modelId, true)
+                            return ParallelRequestResult(true, responseBody, modelId)
+                        }
+                    } catch (_: Exception) {}
+                    StatsManager.recordCall(modelId, false)
+                    return ParallelRequestResult(false, responseBody, modelId, "Invalid response format")
+                }
+                StatsManager.recordCall(modelId, false)
+                return ParallelRequestResult(false, responseBody, modelId, "HTTP ${response.code}")
+            } finally {
+                RouterState.releaseModel(modelId)
+            }
+        } catch (e: Exception) {
+            try { StatsManager.recordCall(modelId, false) } catch (_: Exception) {}
+            return ParallelRequestResult(false, null, modelId, e.message ?: "unknown")
+        }
+    }
+
+    /**
+     * 慢响应处理：30秒未返回则并行发送给下一个模型，最多5次，取首个成功结果
+     */
+    private fun handleSlowResponseWithParallel(body: JsonObject, group: String, firstModelId: String): Response {
+        val triedModelIds = mutableSetOf(firstModelId)
+        val successFound = java.util.concurrent.atomic.AtomicBoolean(false)
+        val firstSuccess = AtomicReference<ParallelRequestResult?>(null)
+        val allFutures = java.util.concurrent.CopyOnWriteArrayList<CompletableFuture<ParallelRequestResult>>()
+
+        // 启动第一个请求
+        val firstFuture = CompletableFuture.supplyAsync(
+            {
+                val result = executeModelRequest(body, firstModelId, SLOW_RESPONSE_TIMEOUT_MS * 2)
+                if (result.success && successFound.compareAndSet(false, true)) {
+                    firstSuccess.set(result)
+                }
+                result
+            },
+            parallelRequestExecutor
+        )
+        allFutures.add(firstFuture)
+
+        var currentFuture = firstFuture
+        var currentModelId = firstModelId
+
+        for (attempt in 1 until MAX_PARALLEL_ATTEMPTS) {
+            if (successFound.get()) break
+
+            // 等待30秒看当前请求是否返回
+            try {
+                currentFuture.get(SLOW_RESPONSE_TIMEOUT_MS, TimeUnit.MILLISECONDS)
+                // 当前请求已返回（成功或失败）
+                if (successFound.get()) break
+            } catch (_: java.util.concurrent.TimeoutException) {
+                // 30秒未返回，启动下一个模型请求
+                Log.w(TAG, "Slow response: model $currentModelId not returned in ${SLOW_RESPONSE_TIMEOUT_MS}ms, starting next model (attempt $attempt)")
+            } catch (e: Exception) {
+                Log.e(TAG, "Error waiting for model $currentModelId response", e)
+            }
+
+            if (successFound.get()) break
+
+            // 选择下一个模型
+            val nextModel = configManager.selectFastestModel(group)
+            if (nextModel == null || nextModel in triedModelIds) {
+                Log.w(TAG, "No more alternative models for parallel request")
+                break
+            }
+            triedModelIds.add(nextModel)
+            currentModelId = nextModel
+
+            // 启动下一个模型的请求
+            val nextFuture = CompletableFuture.supplyAsync(
+                {
+                    val result = executeModelRequest(body, nextModel, SLOW_RESPONSE_TIMEOUT_MS * 2)
+                    if (result.success && successFound.compareAndSet(false, true)) {
+                        firstSuccess.set(result)
+                    }
+                    result
+                },
+                parallelRequestExecutor
+            )
+            allFutures.add(nextFuture)
+            currentFuture = nextFuture
+        }
+
+        // 如果还没有成功，等待所有请求完成，取第一个成功的结果
+        if (firstSuccess.get() == null) {
+            for (future in allFutures) {
+                if (successFound.get()) break
+                try {
+                    val result = future.get(SLOW_RESPONSE_TIMEOUT_MS, TimeUnit.MILLISECONDS)
+                    if (result.success && successFound.compareAndSet(false, true)) {
+                        firstSuccess.set(result)
+                        break
+                    }
+                } catch (_: Exception) {}
+            }
+        }
+
+        // 返回第一个成功的结果
+        val successResult = firstSuccess.get()
+        if (successResult != null) {
+            Log.i(TAG, "Parallel request succeeded with model ${successResult.modelId}")
+            return newFixedLengthResponse(Response.Status.OK, "application/json", successResult.response)
+        }
+
+        // 所有请求都失败了，收集错误信息并对失败模型启动健康检测
+        val errors = allFutures.mapNotNull { future ->
+            try { future.getNow(ParallelRequestResult(false, null, "", "not completed")) }
+            catch (_: Exception) { null }
+        }
+
+        // 对失败的模型启动健康检测（去重）
+        val processedModels = mutableSetOf<String>()
+        for (error in errors) {
+            if (error.modelId.isNotEmpty() && error.modelId !in processedModels) {
+                processedModels.add(error.modelId)
+                val wasLocked = RouterState.getLockedModel(group) == error.modelId
+                if (wasLocked) {
+                    RouterState.unlockGroup(group)
+                }
+                startHealthCheckWithBackoff(error.modelId, group, wasLocked, "parallel_error")
+                RouterState.updateModelError(error.modelId, error.error ?: "请求失败")
+            }
+        }
+
+        val errorMsg = errors.firstOrNull { !it.error.isNullOrEmpty() }?.error ?: "All models failed"
+        Log.w(TAG, "All parallel requests failed, tried models: $triedModelIds, errors: ${errors.map { "${it.modelId}: ${it.error}" }}")
+        return jsonError("api_error", "All parallel requests failed: $errorMsg")
     }
 
     private val modelsClient = OkHttpClient.Builder()

@@ -25,18 +25,16 @@ object RouterState {
 
     private val activeConnections = ConcurrentHashMap<String, AtomicInteger>()
 
-    // ===== Health check 状态跟踪 =====
-    /** 每个模型连续 health check 失败次数 */
-    private val healthCheckFailures = ConcurrentHashMap<String, Int>()
-    /** 每个模型下次允许 health check 的时间戳(ms) */
-    private val nextHealthCheckTime = ConcurrentHashMap<String, Long>()
+    // 健康检测管理：记录出错前是否为锁定状态，以及健康检测任务是否在运行
+    private val healthCheckInfoMap = ConcurrentHashMap<String, HealthCheckInfo>()
 
-    /** 基础 health check 间隔: 2分钟 */
-    const val HEALTH_CHECK_BASE_INTERVAL_MS = 120_000L
-    /** 指数退避前允许的连续失败次数 */
-    const val HEALTH_CHECK_BACKOFF_THRESHOLD = 10
-    /** 指数退避最大间隔: 30分钟 */
-    const val HEALTH_CHECK_MAX_INTERVAL_MS = 1_800_000L
+    data class HealthCheckInfo(
+        val modelId: String,
+        val groupName: String,
+        val wasLocked: Boolean,
+        val errorType: String,
+        @Volatile var running: Boolean = true
+    )
 
     fun acquireModel(modelId: String): Int {
         val counter = activeConnections.computeIfAbsent(modelId) { AtomicInteger(0) }
@@ -116,60 +114,17 @@ object RouterState {
         speedTestResultsMap[modelId] = -1L
         _speedTestResults.postValue(speedTestResultsMap.toMap())
         modelAvailabilityMap[modelId] = false
-        // 首次失败时初始化 health check 计划
-        if (!healthCheckFailures.containsKey(modelId)) {
-            healthCheckFailures[modelId] = 0
-            nextHealthCheckTime[modelId] = System.currentTimeMillis() + HEALTH_CHECK_BASE_INTERVAL_MS
-            Log.i(TAG, "Model $modelId marked error: $error, health check scheduled in ${HEALTH_CHECK_BASE_INTERVAL_MS / 1000}s")
-        }
     }
 
     /**
-     * 清除模型错误状态，恢复为可用（health check 成功时调用）
+     * 清除模型错误状态，恢复为可用
      */
     fun clearModelError(modelId: String) {
         modelErrorMap.remove(modelId)
         _modelErrors.postValue(modelErrorMap.toMap())
-        healthCheckFailures.remove(modelId)
-        nextHealthCheckTime.remove(modelId)
         modelAvailabilityMap[modelId] = true
         Log.i(TAG, "Model $modelId recovered, error cleared")
     }
-
-    /**
-     * 记录一次 health check 失败，并计算下次检查时间
-     * 前 10 次固定 2 分钟间隔，之后指数退避（2^n * 2分钟，上限 30 分钟）
-     * @return 下次检查的间隔(ms)
-     */
-    fun recordHealthCheckFailure(modelId: String): Long {
-        val failures = (healthCheckFailures[modelId] ?: 0) + 1
-        healthCheckFailures[modelId] = failures
-
-        val interval = if (failures <= HEALTH_CHECK_BACKOFF_THRESHOLD) {
-            HEALTH_CHECK_BASE_INTERVAL_MS
-        } else {
-            // 指数退避: 2^(failures - threshold) * 基础间隔，上限 30 分钟
-            val exponent = failures - HEALTH_CHECK_BACKOFF_THRESHOLD
-            val backoff = HEALTH_CHECK_BASE_INTERVAL_MS * (1L shl exponent)
-            minOf(backoff, HEALTH_CHECK_MAX_INTERVAL_MS)
-        }
-        nextHealthCheckTime[modelId] = System.currentTimeMillis() + interval
-        Log.w(TAG, "Health check failed for $modelId (attempt $failures), next retry in ${interval / 1000}s")
-        return interval
-    }
-
-    /**
-     * 返回当前需要 health check 的模型列表（有错误且已到检查时间）
-     */
-    fun getModelsNeedingHealthCheck(): List<String> {
-        val now = System.currentTimeMillis()
-        return modelErrorMap.keys.filter { modelId ->
-            val nextTime = nextHealthCheckTime[modelId]
-            nextTime != null && now >= nextTime
-        }
-    }
-
-    fun getHealthCheckFailures(modelId: String): Int = healthCheckFailures[modelId] ?: 0
 
     fun getModelErrors(): Map<String, String> = modelErrorMap.toMap()
 
@@ -191,9 +146,45 @@ object RouterState {
         speedTestResultsMap.keys.filter { !activeModelIds.contains(it) }.forEach { speedTestResultsMap.remove(it) }
         modelAvailabilityMap.keys.filter { !activeModelIds.contains(it) }.forEach { modelAvailabilityMap.remove(it) }
         modelErrorMap.keys.filter { !activeModelIds.contains(it) }.forEach { modelErrorMap.remove(it) }
-        healthCheckFailures.keys.filter { !activeModelIds.contains(it) }.forEach { healthCheckFailures.remove(it) }
-        nextHealthCheckTime.keys.filter { !activeModelIds.contains(it) }.forEach { nextHealthCheckTime.remove(it) }
+        healthCheckInfoMap.keys.filter { !activeModelIds.contains(it) }.forEach { healthCheckInfoMap.remove(it) }
         _speedTestResults.postValue(speedTestResultsMap.toMap())
         _modelErrors.postValue(modelErrorMap.toMap())
     }
+
+    // 启动健康检测任务，记录出错前是否为锁定状态
+    fun startHealthCheck(modelId: String, groupName: String, wasLocked: Boolean, errorType: String): HealthCheckInfo {
+        val info = HealthCheckInfo(modelId, groupName, wasLocked, errorType, running = true)
+        healthCheckInfoMap[modelId] = info
+        return info
+    }
+
+    // 获取健康检测信息
+    fun getHealthCheckInfo(modelId: String): HealthCheckInfo? = healthCheckInfoMap[modelId]
+
+    // 健康检测完成，恢复模型状态
+    fun finishHealthCheck(modelId: String) {
+        val info = healthCheckInfoMap.remove(modelId)
+        if (info != null) {
+            info.running = false
+            // 清除模型错误状态
+            modelErrorMap.remove(modelId)
+            _modelErrors.postValue(modelErrorMap.toMap())
+            modelAvailabilityMap[modelId] = true
+            // 如果之前是锁定状态，恢复锁定
+            if (info.wasLocked) {
+                lockedModelsMap[info.groupName] = modelId
+                _lockedModels.postValue(lockedModelsMap.toMap())
+                Log.i(TAG, "Restored lock for model $modelId in group ${info.groupName} after health recovery")
+            }
+            Log.i(TAG, "Health check finished for model $modelId, model recovered")
+        }
+    }
+
+    // 检查模型是否正在进行健康检测
+    fun isHealthCheckRunning(modelId: String): Boolean {
+        return healthCheckInfoMap[modelId]?.running == true
+    }
+
+    // 获取所有正在进行的健康检测
+    fun getActiveHealthChecks(): Map<String, HealthCheckInfo> = healthCheckInfoMap.toMap()
 }

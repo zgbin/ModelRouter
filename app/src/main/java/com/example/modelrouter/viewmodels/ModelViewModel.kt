@@ -37,7 +37,7 @@ class ModelViewModel(application: Application) : AndroidViewModel(application) {
     val error: LiveData<String?> = _error
 
     init {
-        loadModels()
+        loadLocalModels()
         _groups.value = loadSavedGroups()
     }
 
@@ -77,14 +77,16 @@ class ModelViewModel(application: Application) : AndroidViewModel(application) {
                     } ?: emptyList()
                     _allModels.value = items
                     _models.value = items
+                    val fetchedAt = java.text.SimpleDateFormat("yyyy-MM-dd HH:mm:ss").format(java.util.Date())
                     _stats.value = ModelStats(
                         totalCount = items.size,
                         ownersCount = items.map { it.owner }.distinct().size,
                         docVersion = "v1",
-                        fetchedAt = java.text.SimpleDateFormat("yyyy-MM-dd HH:mm:ss").format(java.util.Date()),
+                        fetchedAt = fetchedAt,
                         topOwners = items.groupingBy { it.owner }.eachCount(),
                         sources = mapOf("nvidia_api" to items.size)
                     )
+                    saveLocalModels(items, fetchedAt)
                 } else {
                     _error.value = "API请求失败: ${response.code()}"
                 }
@@ -94,6 +96,35 @@ class ModelViewModel(application: Application) : AndroidViewModel(application) {
                 _loading.value = false
             }
         }
+    }
+
+    private fun loadLocalModels() {
+        try {
+            val modelsJson = prefs.getString("cached_nvidia_models", null)
+            val statsJson = prefs.getString("cached_nvidia_stats", null)
+            if (modelsJson != null) {
+                val type = object : TypeToken<List<ModelItem>>() {}.type
+                val items: List<ModelItem> = gson.fromJson(modelsJson, type)
+                _allModels.value = items
+                _models.value = items
+            }
+            if (statsJson != null) {
+                val stats: ModelStats = gson.fromJson(statsJson, ModelStats::class.java)
+                _stats.value = stats
+            }
+        } catch (_: Exception) { }
+    }
+
+    private fun saveLocalModels(items: List<ModelItem>, fetchedAt: String) {
+        try {
+            val modelsJson = gson.toJson(items)
+            val stats = _stats.value
+            val statsJson = if (stats != null) gson.toJson(stats) else null
+            prefs.edit()
+                .putString("cached_nvidia_models", modelsJson)
+                .putString("cached_nvidia_stats", statsJson)
+                .apply()
+        } catch (_: Exception) { }
     }
 
     fun searchModels(query: String) {

@@ -29,7 +29,6 @@ class ModelsFragment : Fragment() {
         setupRecyclerView()
         setupObservers()
         setupListeners()
-        viewModel.loadModels()
         return binding.root
     }
 
@@ -73,8 +72,6 @@ class ModelsFragment : Fragment() {
             val query = binding.etSearch.text.toString().trim()
             if (query.isNotEmpty()) {
                 viewModel.searchModels(query)
-            } else {
-                viewModel.loadModels()
             }
             true
         }

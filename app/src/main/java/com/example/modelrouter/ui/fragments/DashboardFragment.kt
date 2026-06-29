@@ -75,6 +75,7 @@ class DashboardFragment : Fragment() {
         setupRecyclerView()
         setupObservers()
         setupListeners()
+        setupAppVersion()
         postBuildUI()
         fetchRuntimeFromServer()
         return binding.root
@@ -95,7 +96,7 @@ class DashboardFragment : Fragment() {
 
     override fun onHiddenChanged(hidden: Boolean) {
         super.onHiddenChanged(hidden)
-        if (!hidden) {
+        if (!hidden && isAdded) {
             postBuildUI()
             fetchRuntimeFromServer()
             startAutoRefresh()
@@ -114,6 +115,22 @@ class DashboardFragment : Fragment() {
         stopAutoRefresh()
         stopAutoSpeedTest()
         cancelBatchSpeedTest()
+    }
+
+    private fun setupAppVersion() {
+        try {
+            val packageInfo = requireContext().packageManager.getPackageInfo(requireContext().packageName, 0)
+            val versionName = packageInfo.versionName ?: "unknown"
+            val versionCode = if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.P) {
+                packageInfo.longVersionCode
+            } else {
+                @Suppress("DEPRECATION")
+                packageInfo.versionCode.toLong()
+            }
+            binding.tvAppVersion.text = "v$versionName ($versionCode)"
+        } catch (_: Exception) {
+            binding.tvAppVersion.text = "v--"
+        }
     }
 
     private fun startAutoRefresh() {
@@ -222,6 +239,8 @@ class DashboardFragment : Fragment() {
     }
 
     private fun postBuildUI() {
+        if (!isAdded) return
+
         val now = System.currentTimeMillis()
         val last = lastBuildTime.get()
         if (now - last < 200 && last > 0) {
@@ -237,6 +256,7 @@ class DashboardFragment : Fragment() {
         }
 
         lifecycleScope.launch {
+            if (!isAdded) return@launch
             try {
                 val groups = viewModel.groups.value ?: emptyList()
                 if (!::binding.isInitialized) return@launch

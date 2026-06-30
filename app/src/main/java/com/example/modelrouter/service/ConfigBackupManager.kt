@@ -94,7 +94,7 @@ object ConfigBackupManager {
 
             // 备份 Provider
             val providerPrefs = appContext.getSharedPreferences("provider_manager", Context.MODE_PRIVATE)
-            val providersJson = providerPrefs.getString("providers", null)
+            val providersJson = providerPrefs.getString("providers_json", null)
             if (providersJson != null) {
                 writeBackup(FILE_PROVIDERS, providersJson)
             }
@@ -133,10 +133,10 @@ object ConfigBackupManager {
                 "package" to appContext.packageName
             )
             writeBackup(FILE_META, gson.toJson(meta))
-        } catch (_: Exception) {}
+        } catch (e: Exception) {
+            Log.w(TAG, "Failed to update backup meta", e)
+        }
     }
-
-    // ===== 恢复 =====
 
     /**
      * 检查是否有可恢复的备份，且当前配置为空（首次安装或被清除）
@@ -150,56 +150,62 @@ object ConfigBackupManager {
                 return
             }
 
-            // 检查备份元数据
-            val metaFile = File(backupDir, FILE_META)
-            if (!metaFile.exists()) {
-                Log.d(TAG, "No backup meta found")
-                return
-            }
-
-            // 检查当前是否需要恢复（分组配置为空说明是新安装或被清除）
             val groupsPrefs = appContext.getSharedPreferences(Constants.PREFS_NAME, Context.MODE_PRIVATE)
-            val hasGroups = groupsPrefs.contains("saved_groups")
+            val providerPrefs = appContext.getSharedPreferences("provider_manager", Context.MODE_PRIVATE)
+            val keyPrefs = appContext.getSharedPreferences("api_key_manager", Context.MODE_PRIVATE)
 
-            if (hasGroups) {
-                Log.d(TAG, "Current config exists, skip restore")
+            val needGroups = !groupsPrefs.contains("saved_groups")
+            val needProviders = !providerPrefs.contains("providers_json")
+            val needKeys = !keyPrefs.contains("work_keys_json")
+
+            if (!needGroups && !needProviders && !needKeys) {
+                Log.d(TAG, "All configs exist, skip restore")
                 return
             }
 
-            Log.i(TAG, "Current config is empty, restoring from backup...")
-            restoreFromBackup()
+            Log.i(TAG, "Restoring from backup: groups=$needGroups providers=$needProviders keys=$needKeys")
+            restoreFromBackup(needGroups, needProviders, needKeys)
         } catch (e: Exception) {
             Log.e(TAG, "Restore check failed", e)
         }
     }
 
-    private fun restoreFromBackup() {
+    private fun restoreFromBackup(restoreGroups: Boolean, restoreProviders: Boolean, restoreKeys: Boolean) {
         val backupDir = getBackupDir()
         var restored = 0
 
         // 恢复分组配置
-        val groupsFile = File(backupDir, FILE_GROUPS)
-        if (groupsFile.exists()) {
-            val json = groupsFile.readText()
-            appContext.getSharedPreferences(Constants.PREFS_NAME, Context.MODE_PRIVATE)
-                .edit().putString("saved_groups", json).apply()
-            restored++
-            Log.i(TAG, "Restored groups config")
+        if (restoreGroups) {
+            val groupsFile = File(backupDir, FILE_GROUPS)
+            if (groupsFile.exists()) {
+                val json = groupsFile.readText()
+                if (json.isNotBlank()) {
+                    appContext.getSharedPreferences(Constants.PREFS_NAME, Context.MODE_PRIVATE)
+                        .edit().putString("saved_groups", json).apply()
+                    restored++
+                    Log.i(TAG, "Restored groups config")
+                }
+            }
         }
 
         // 恢复 Provider 配置
-        val providersFile = File(backupDir, FILE_PROVIDERS)
-        if (providersFile.exists()) {
-            val json = providersFile.readText()
-            appContext.getSharedPreferences("provider_manager", Context.MODE_PRIVATE)
-                .edit().putString("providers", json).apply()
-            restored++
-            Log.i(TAG, "Restored providers config")
+        if (restoreProviders) {
+            val providersFile = File(backupDir, FILE_PROVIDERS)
+            if (providersFile.exists()) {
+                val json = providersFile.readText()
+                if (json.isNotBlank()) {
+                    appContext.getSharedPreferences("provider_manager", Context.MODE_PRIVATE)
+                        .edit().putString("providers_json", json).apply()
+                    restored++
+                    Log.i(TAG, "Restored providers config")
+                }
+            }
         }
 
         // 恢复 API Key 配置
-        val keysFile = File(backupDir, FILE_API_KEYS)
-        if (keysFile.exists()) {
+        if (restoreKeys) {
+            val keysFile = File(backupDir, FILE_API_KEYS)
+            if (keysFile.exists()) {
             try {
                 val json = keysFile.readText()
                 val type = object : TypeToken<Map<String, Any?>>() {}.type
@@ -208,14 +214,15 @@ object ConfigBackupManager {
 
                 (keysMap["speed_test_key"] as? String)?.let { editor.putString("speed_test_key", it) }
                 (keysMap["work_keys_json"] as? String)?.let { editor.putString("work_keys_json", it) }
-                (keysMap["max_per_minute"] as? Double)?.let { editor.putInt("max_per_minute", it.toInt()) }
-                (keysMap["switch_threshold"] as? Double)?.let { editor.putInt("switch_threshold", it.toInt()) }
+                (keysMap["max_per_minute"] as? Number)?.toInt()?.let { editor.putInt("max_per_minute", it) }
+                (keysMap["switch_threshold"] as? Number)?.toInt()?.let { editor.putInt("switch_threshold", it) }
 
                 editor.apply()
                 restored++
                 Log.i(TAG, "Restored API keys config")
             } catch (e: Exception) {
-                Log.e(TAG, "Failed to restore API keys", e)
+                    Log.e(TAG, "Failed to restore API keys", e)
+                }
             }
         }
 

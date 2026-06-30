@@ -233,7 +233,9 @@ class DashboardFragment : Fragment() {
                 }
             } catch (_: Exception) { }
             withContext(Dispatchers.Main) {
-                binding.progressBar.visibility = View.GONE
+                if (isAdded && ::binding.isInitialized) {
+                    binding.progressBar.visibility = View.GONE
+                }
             }
         }
     }
@@ -351,7 +353,7 @@ class DashboardFragment : Fragment() {
                 binding.rvGroups.visibility = View.VISIBLE
             } finally {
                 buildingUI.set(false)
-                if (uiUpdatePending.compareAndSet(true, false)) {
+                if (uiUpdatePending.compareAndSet(true, false) && isAdded) {
                     lastBuildTime.set(0)
                     postBuildUI()
                 }
@@ -360,14 +362,16 @@ class DashboardFragment : Fragment() {
     }
 
     private fun buildKeyManagerStatus(status: KeyManagerStatus) {
+        if (!isAdded || !::binding.isInitialized) return
+        val ctx = context ?: return
         binding.containerKeyItems.removeAllViews()
         val maxPm = status.maxPerMinute
         val maxPmInt = maxPm.toIntOrNull() ?: 35
 
         if (status.requestCounts.isEmpty()) {
-            val emptyText = TextView(requireContext()).apply {
+            val emptyText = TextView(ctx).apply {
                 text = "暂无Key使用数据"
-                setTextColor(ContextCompat.getColor(context, R.color.textMuted))
+                setTextColor(ContextCompat.getColor(ctx, R.color.textMuted))
                 textSize = 13f
                 setPadding(0, 8, 0, 8)
             }
@@ -383,7 +387,7 @@ class DashboardFragment : Fragment() {
                 keyName
             }
 
-            val itemLayout = LinearLayout(requireContext()).apply {
+            val itemLayout = LinearLayout(ctx).apply {
                 orientation = LinearLayout.HORIZONTAL
                 setPadding(0, 6, 0, 6)
                 layoutParams = LinearLayout.LayoutParams(
@@ -393,41 +397,41 @@ class DashboardFragment : Fragment() {
                 gravity = android.view.Gravity.CENTER_VERTICAL
             }
 
-            val nameText = TextView(requireContext()).apply {
+            val nameText = TextView(ctx).apply {
                 text = displayName
-                setTextColor(ContextCompat.getColor(context, R.color.accent))
+                setTextColor(ContextCompat.getColor(ctx, R.color.accent))
                 textSize = 11f
                 typeface = android.graphics.Typeface.MONOSPACE
                 layoutParams = LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f)
             }
 
-            val countText = TextView(requireContext()).apply {
+            val countText = TextView(ctx).apply {
                 text = "$count/$maxPm"
-                setTextColor(ContextCompat.getColor(context, R.color.textSecondary))
+                setTextColor(ContextCompat.getColor(ctx, R.color.textSecondary))
                 textSize = 11f
                 typeface = android.graphics.Typeface.MONOSPACE
                 setPadding(12, 0, 8, 0)
             }
 
-            val barBg = View(requireContext()).apply {
+            val barBg = View(ctx).apply {
                 layoutParams = LinearLayout.LayoutParams(80, 8).apply {
                     gravity = android.view.Gravity.CENTER_VERTICAL
                 }
-                setBackgroundColor(ContextCompat.getColor(context, R.color.surfaceVariant))
+                setBackgroundColor(ContextCompat.getColor(ctx, R.color.surfaceVariant))
             }
 
-            val barFill = View(requireContext()).apply {
+            val barFill = View(ctx).apply {
                 layoutParams = LinearLayout.LayoutParams(
                     (80 * pct / 100).coerceAtLeast(1),
                     LinearLayout.LayoutParams.MATCH_PARENT
                 )
                 setBackgroundColor(ContextCompat.getColor(
-                    context,
+                    ctx,
                     if (pct > 80) R.color.error else if (pct > 50) R.color.warning else R.color.success
                 ))
             }
 
-            val barContainer = android.widget.FrameLayout(requireContext()).apply {
+            val barContainer = android.widget.FrameLayout(ctx).apply {
                 layoutParams = LinearLayout.LayoutParams(80, 8).apply {
                     gravity = android.view.Gravity.CENTER_VERTICAL
                 }
@@ -459,9 +463,9 @@ class DashboardFragment : Fragment() {
 
     private fun runAllSpeedTests() {
         val groups = viewModel.groups.value ?: emptyList()
-        val allModels = groups.flatMap { it.models }.filter { it.providerId == "nvidia" }
+        val allModels = groups.flatMap { it.models }
         if (allModels.isEmpty()) {
-            Toast.makeText(context, "没有NVIDIA模型可测速", Toast.LENGTH_SHORT).show()
+            Toast.makeText(context, "没有模型可测速", Toast.LENGTH_SHORT).show()
             return
         }
 
@@ -567,7 +571,7 @@ class DashboardFragment : Fragment() {
             delay(300000)
             while (isActive) {
                 val groups = viewModel.groups.value ?: emptyList()
-                val allModels = groups.flatMap { it.models }.filter { it.providerId == "nvidia" }
+                val allModels = groups.flatMap { it.models }
                 if (allModels.isEmpty()) {
                     delay(300000)
                     continue

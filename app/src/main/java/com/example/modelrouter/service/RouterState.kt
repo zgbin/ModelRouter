@@ -146,7 +146,15 @@ object RouterState {
         speedTestResultsMap.keys.filter { !activeModelIds.contains(it) }.forEach { speedTestResultsMap.remove(it) }
         modelAvailabilityMap.keys.filter { !activeModelIds.contains(it) }.forEach { modelAvailabilityMap.remove(it) }
         modelErrorMap.keys.filter { !activeModelIds.contains(it) }.forEach { modelErrorMap.remove(it) }
-        healthCheckInfoMap.keys.filter { !activeModelIds.contains(it) }.forEach { healthCheckInfoMap.remove(it) }
+        // 对运行中的健康检测不直接移除，只停止运行标记
+        healthCheckInfoMap.keys.filter { !activeModelIds.contains(it) }.forEach { modelId ->
+            val info = healthCheckInfoMap[modelId]
+            if (info != null && info.running) {
+                info.running = false
+            } else {
+                healthCheckInfoMap.remove(modelId)
+            }
+        }
         _speedTestResults.postValue(speedTestResultsMap.toMap())
         _modelErrors.postValue(modelErrorMap.toMap())
     }
@@ -170,8 +178,8 @@ object RouterState {
             modelErrorMap.remove(modelId)
             _modelErrors.postValue(modelErrorMap.toMap())
             modelAvailabilityMap[modelId] = true
-            // 如果之前是锁定状态，恢复锁定
-            if (info.wasLocked) {
+            // 如果之前是锁定状态，且当前分组没有其他锁定（避免覆盖用户手动锁定的新模型），才恢复锁定
+            if (info.wasLocked && !lockedModelsMap.containsKey(info.groupName)) {
                 lockedModelsMap[info.groupName] = modelId
                 _lockedModels.postValue(lockedModelsMap.toMap())
                 Log.i(TAG, "Restored lock for model $modelId in group ${info.groupName} after health recovery")

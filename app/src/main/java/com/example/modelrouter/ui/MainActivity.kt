@@ -43,12 +43,12 @@ class MainActivity : AppCompatActivity() {
     private val servers = mutableListOf<ModelRouterServer>()
     private val startedPorts = mutableSetOf<Int>()
 
-    private val modelsFragment by lazy { ModelsFragment() }
-    private val dashboardFragment by lazy { DashboardFragment() }
-    private val configFragment by lazy { ConfigFragment() }
-    private val apiKeysFragment by lazy { ApiKeysFragment() }
+    private var modelsFragment: ModelsFragment? = null
+    private var dashboardFragment: DashboardFragment? = null
+    private var configFragment: ConfigFragment? = null
+    private var apiKeysFragment: ApiKeysFragment? = null
 
-    private var activeFragment: Fragment = modelsFragment
+    private var activeFragment: Fragment? = null
 
     companion object {
         private const val TAG = "MainActivity"
@@ -97,6 +97,8 @@ class MainActivity : AppCompatActivity() {
 
         if (savedInstanceState == null) {
             setupFragments()
+        } else {
+            restoreFragments()
         }
 
         binding.bottomNav.setOnItemSelectedListener { item ->
@@ -107,7 +109,9 @@ class MainActivity : AppCompatActivity() {
                 R.id.nav_api_keys -> apiKeysFragment
                 else -> modelsFragment
             }
-            switchFragment(fragment)
+            if (fragment != null) {
+                switchFragment(fragment)
+            }
             true
         }
 
@@ -281,21 +285,45 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun setupFragments() {
+        modelsFragment = ModelsFragment()
+        dashboardFragment = DashboardFragment()
+        configFragment = ConfigFragment()
+        apiKeysFragment = ApiKeysFragment()
+
         supportFragmentManager.beginTransaction().apply {
-            add(R.id.fragment_container, apiKeysFragment, "api_keys").hide(apiKeysFragment)
-            add(R.id.fragment_container, configFragment, "config").hide(configFragment)
-            add(R.id.fragment_container, dashboardFragment, "dashboard").hide(dashboardFragment)
-            add(R.id.fragment_container, modelsFragment, "models")
+            add(R.id.fragment_container, apiKeysFragment!!, "api_keys").hide(apiKeysFragment!!)
+            add(R.id.fragment_container, configFragment!!, "config").hide(configFragment!!)
+            add(R.id.fragment_container, dashboardFragment!!, "dashboard").hide(dashboardFragment!!)
+            add(R.id.fragment_container, modelsFragment!!, "models")
         }.commit()
         activeFragment = modelsFragment
     }
 
+    private fun restoreFragments() {
+        val fm = supportFragmentManager
+        modelsFragment = fm.findFragmentByTag("models") as? ModelsFragment
+        dashboardFragment = fm.findFragmentByTag("dashboard") as? DashboardFragment
+        configFragment = fm.findFragmentByTag("config") as? ConfigFragment
+        apiKeysFragment = fm.findFragmentByTag("api_keys") as? ApiKeysFragment
+
+        // 确定当前可见的Fragment，兜底选第一个
+        activeFragment = listOfNotNull(modelsFragment, dashboardFragment, configFragment, apiKeysFragment)
+            .firstOrNull { !it.isHidden }
+            ?: modelsFragment
+            ?: dashboardFragment
+            ?: configFragment
+            ?: apiKeysFragment
+    }
+
     private fun switchFragment(target: Fragment) {
         if (target == activeFragment) return
-        supportFragmentManager.beginTransaction().apply {
-            hide(activeFragment)
-            show(target)
-        }.commit()
+        val current = activeFragment
+        if (current != null) {
+            supportFragmentManager.beginTransaction().apply {
+                hide(current)
+                show(target)
+            }.commit()
+        }
         activeFragment = target
     }
 
@@ -314,6 +342,9 @@ class MainActivity : AppCompatActivity() {
         try {
             unregisterReceiver(restartReceiver)
         } catch (_: Exception) {}
+        if (isFinishing) {
+            stopAllServers()
+        }
         super.onDestroy()
     }
 }

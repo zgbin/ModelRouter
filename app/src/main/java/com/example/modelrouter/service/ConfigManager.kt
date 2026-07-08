@@ -72,6 +72,10 @@ object ConfigManager {
         val candidates = if (available.isNotEmpty()) available else enabledModels
         val sortedBySpeed = candidates.sortedBy { speedResults[it.id] ?: Long.MAX_VALUE }
         val bestTime = speedResults[sortedBySpeed.first().id] ?: Long.MAX_VALUE
+        // 当 bestTime < 0（所有模型都是错误状态的 -1），直接从所有候选中选最少连接的
+        if (bestTime < 0) {
+            return candidates.minByOrNull { RouterState.getActiveConnections(it.id) }?.id
+        }
         val nearBest = sortedBySpeed.filter { m ->
             val rt = speedResults[m.id]
             if (rt == null) true

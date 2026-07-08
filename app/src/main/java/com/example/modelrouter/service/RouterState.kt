@@ -157,10 +157,11 @@ object RouterState {
     }
 
     // 启动健康检测任务，记录出错前是否为锁定状态
-    fun startHealthCheck(modelId: String, groupName: String, wasLocked: Boolean, errorType: String): HealthCheckInfo {
+    // 使用 putIfAbsent 保证原子性，避免并发重复启动健康检测
+    fun startHealthCheck(modelId: String, groupName: String, wasLocked: Boolean, errorType: String): HealthCheckInfo? {
         val info = HealthCheckInfo(modelId, groupName, wasLocked, errorType, running = true)
-        healthCheckInfoMap[modelId] = info
-        return info
+        val existing = healthCheckInfoMap.putIfAbsent(modelId, info)
+        return if (existing == null) info else null  // 返回 null 表示已有检测在运行
     }
 
     // 获取健康检测信息

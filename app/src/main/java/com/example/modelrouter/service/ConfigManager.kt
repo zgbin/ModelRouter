@@ -65,14 +65,21 @@ object ConfigManager {
         val enabledModels = group.models.filter { it.enabled }
         if (enabledModels.isEmpty()) return null
         val speedResults = RouterState.getSpeedTestResults()
+        // 优先选择有有效测速结果且可用的模型
         val available = enabledModels.filter { m ->
             val rt = speedResults[m.id]
             rt != null && rt >= 0 && rt <= 120000
         }
-        val candidates = if (available.isNotEmpty()) available else enabledModels
+        // 其次选择未测速但未出错的模型（isModelAvailable 同时检查 errorMap 和 speedResults）
+        val noErrorModels = enabledModels.filter { RouterState.isModelAvailable(it.id) }
+        val candidates = when {
+            available.isNotEmpty() -> available
+            noErrorModels.isNotEmpty() -> noErrorModels
+            else -> enabledModels  // 全部出错时退化，仍尝试请求
+        }
         val sortedBySpeed = candidates.sortedBy { speedResults[it.id] ?: Long.MAX_VALUE }
         val bestTime = speedResults[sortedBySpeed.first().id] ?: Long.MAX_VALUE
-        // 当 bestTime < 0（所有模型都是错误状态的 -1），直接从所有候选中选最少连接的
+        // 当 bestTime < 0（候选模型都是错误状态的 -1），直接从所有候选中选最少连接的
         if (bestTime < 0) {
             return candidates.minByOrNull { RouterState.getActiveConnections(it.id) }?.id
         }

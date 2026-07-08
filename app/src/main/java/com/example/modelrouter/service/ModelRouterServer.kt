@@ -322,20 +322,24 @@ class ModelRouterServer(port: Int = 8190) : NanoHTTPD(port) {
                                 break
                             }
                             if (response.code == 400) {
+                                // 400 是客户端请求错误（如不支持的参数/tool格式），不应下线模型
                                 Log.w(TAG, "Stream 400 error from $providerId: ${errorBody.take(300)}")
                                 try {
                                     val reqBody = JsonParser.parseString(bodyStr).asJsonObject
                                     val sentParams = reqBody.keySet().filter { it != "messages" }
                                     Log.w(TAG, "Stream request params to $providerId: $sentParams")
                                 } catch (_: Exception) {}
+                                StatsManager.recordCall(modelId, false)
+                                // 直接返回错误给客户端，不切换模型
+                                return newFixedLengthResponse(Response.Status.BAD_REQUEST, "application/json", errorBody)
                             } else {
                                 Log.w(TAG, "Stream upstream error HTTP ${response.code}: ${errorBody.take(200)}")
+                                StatsManager.recordCall(modelId, false)
+                                // 5xx/其他错误：解锁分组 + 切换模型 + 启动健康检测
+                                handleModelErrorAndSwitch(modelId, group, "http_${response.code}", "HTTP ${response.code}")
+                                switchModel = true
+                                break
                             }
-                            StatsManager.recordCall(modelId, false)
-                            // 其他HTTP错误：解锁分组 + 切换模型 + 启动健康检测
-                            handleModelErrorAndSwitch(modelId, group, "http_${response.code}", "HTTP ${response.code}")
-                            switchModel = true
-                            break
                         }
                         val responseBody = response.body
                         if (responseBody == null) {
@@ -571,20 +575,23 @@ class ModelRouterServer(port: Int = 8190) : NanoHTTPD(port) {
                                 break
                             }
                             if (response.code == 400) {
+                                // 400 是客户端请求错误，不应下线模型，直接返回错误给客户端
                                 Log.w(TAG, "Anthropic stream 400 from $providerId: ${errorBody.take(300)}")
                                 try {
                                     val reqBody = JsonParser.parseString(bodyStr).asJsonObject
                                     val sentParams = reqBody.keySet().filter { it != "messages" }
                                     Log.w(TAG, "Anthropic stream params to $providerId: $sentParams")
                                 } catch (_: Exception) {}
+                                StatsManager.recordCall(modelId, false)
+                                return anthropicError("invalid_request_error", "Upstream 400: ${errorBody.take(500)}")
                             } else {
                                 Log.w(TAG, "Anthropic stream upstream error HTTP ${response.code}: ${errorBody.take(200)}")
+                                StatsManager.recordCall(modelId, false)
+                                // 5xx/其他错误：解锁分组 + 切换模型 + 启动健康检测
+                                handleModelErrorAndSwitch(modelId, group, "http_${response.code}", "HTTP ${response.code}")
+                                switchModel = true
+                                break
                             }
-                            StatsManager.recordCall(modelId, false)
-                            // 其他HTTP错误：解锁分组 + 切换模型 + 启动健康检测
-                            handleModelErrorAndSwitch(modelId, group, "http_${response.code}", "HTTP ${response.code}")
-                            switchModel = true
-                            break
                         }
 
                         val responseBody = response.body
@@ -937,13 +944,12 @@ class ModelRouterServer(port: Int = 8190) : NanoHTTPD(port) {
      * 恢复后停止检测，如果之前是锁定状态则恢复锁定
      */
     private fun startHealthCheckWithBackoff(modelId: String, groupName: String, wasLocked: Boolean, errorType: String) {
-        // 如果已经有健康检测在运行，不重复启动
-        if (RouterState.isHealthCheckRunning(modelId)) {
+        // 使用 putIfAbsent 原子启动，避免并发重复启动健康检测
+        val healthInfo = RouterState.startHealthCheck(modelId, groupName, wasLocked, errorType)
+        if (healthInfo == null) {
             Log.d(TAG, "Health check already running for model $modelId, skip")
             return
         }
-
-        val healthInfo = RouterState.startHealthCheck(modelId, groupName, wasLocked, errorType)
         Log.i(TAG, "Starting health check for model $modelId (wasLocked=$wasLocked, error=$errorType)")
 
         healthCheckExecutor.execute {
@@ -986,7 +992,7 @@ class ModelRouterServer(port: Int = 8190) : NanoHTTPD(port) {
                                 addProperty("content", "hi")
                             })
                         })
-                        addProperty("max_tokens", 1)
+                        addProperty("max_tokens", 5)
                         addProperty("stream", false)
                     }
 
@@ -1096,6 +1102,10 @@ class ModelRouterServer(port: Int = 8190) : NanoHTTPD(port) {
                     return ParallelRequestResult(false, responseBody, modelId, "Invalid response format")
                 }
                 StatsManager.recordCall(modelId, false)
+                // 400 是客户端错误，不应标记模型错误，特殊标记让上层判断
+                if (response.code == 400) {
+                    return ParallelRequestResult(false, responseBody, modelId, "CLIENT_ERROR_400")
+                }
                 return ParallelRequestResult(false, responseBody, modelId, "HTTP ${response.code}")
             } finally {
                 RouterState.releaseModel(modelId)
@@ -1199,11 +1209,15 @@ class ModelRouterServer(port: Int = 8190) : NanoHTTPD(port) {
             catch (_: Exception) { null }
         }
 
-        // 对失败的模型启动健康检测（去重）
+        // 对失败的模型启动健康检测（去重），但跳过 400 客户端错误（不是模型问题）
         val processedModels = mutableSetOf<String>()
         for (error in errors) {
             if (error.modelId.isNotEmpty() && error.modelId !in processedModels) {
                 processedModels.add(error.modelId)
+                // 400 是客户端错误，不应标记模型错误或启动健康检测
+                if (error.error == "CLIENT_ERROR_400") {
+                    continue
+                }
                 val wasLocked = RouterState.getLockedModel(group) == error.modelId
                 if (wasLocked) {
                     RouterState.unlockGroup(group)
@@ -1696,7 +1710,7 @@ class ModelRouterServer(port: Int = 8190) : NanoHTTPD(port) {
             "authentication_error" -> Response.Status.UNAUTHORIZED
             "permission_error" -> Response.Status.FORBIDDEN
             "not_found_error" -> Response.Status.NOT_FOUND
-            "rate_limit_error" -> Response.Status.INTERNAL_ERROR
+            "rate_limit_error" -> Response.Status.TOO_MANY_REQUESTS
             "invalid_request_error" -> Response.Status.BAD_REQUEST
             "overloaded_error" -> Response.Status.SERVICE_UNAVAILABLE
             "timeout_error" -> Response.Status.SERVICE_UNAVAILABLE

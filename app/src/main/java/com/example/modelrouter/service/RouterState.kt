@@ -25,6 +25,79 @@ object RouterState {
 
     private val activeConnections = ConcurrentHashMap<String, AtomicInteger>()
 
+    // TTFT（首字节时间）与完整响应时间分开统计，避免污染 selectFastestModel 的排序依据
+    private val ttftResultsMap = ConcurrentHashMap<String, Long>()
+    private val _ttftResults = MutableLiveData<Map<String, Long>>(emptyMap())
+    val ttftResults: LiveData<Map<String, Long>> = _ttftResults
+
+    // 连续失败计数：达到阈值才判定模型异常，避免单次抖动触发解锁/健康检测
+    private val consecutiveFailures = ConcurrentHashMap<String, AtomicInteger>()
+    private const val FAILURE_THRESHOLD = 2
+
+    // ===== 被动测速：用真实请求的首字节延迟（TTFT）替代主动测速 =====
+    // 自动测速关闭时 selectFastestModel 仍能凭真实流量知道哪个模型快/慢，零额外探测开销
+    private val realLatencyMap = ConcurrentHashMap<String, LatencyStat>()
+
+    data class LatencyStat(val ewmaMs: Long, val lastAt: Long)
+
+    // EWMA 权重：new = old * 7/10 + sample * 3/10
+    private const val LATENCY_FRESH_MS = 10 * 60 * 1000L // 超过10分钟无样本视为过期，排队恢复后的模型不被旧数据永久压后
+
+    // 慢降级：真实请求持续明显变慢（排队/网络波动）时短暂绕行该模型
+    private const val SLOW_ABSOLUTE_MS = 8000L          // 首字节超过8秒视为慢
+    private const val SLOW_RELATIVE_FLOOR_MS = 2000L    // 相对劣化判定的最低延迟，避免低基线噪声
+    private const val SLOW_STREAK_THRESHOLD = 2         // 连续慢样本达到阈值才降级，单次抖动不触发
+    private const val DEGRADE_COOLDOWN_MS = 60_000L     // 降级冷却60秒，到期自动回到候选
+    private val slowStreaks = ConcurrentHashMap<String, AtomicInteger>()
+    private val degradedUntilMap = ConcurrentHashMap<String, Long>()
+
+    /**
+     * 记录一次真实请求的首字节延迟样本（被动测速）。
+     * 明显变慢（绝对慢或相对自身基线劣化3倍）连续达到阈值时，将模型置入慢降级冷却。
+     */
+    fun recordLatency(modelId: String, ms: Long) {
+        val now = System.currentTimeMillis()
+        var prevEwma: Long? = null
+        realLatencyMap.compute(modelId) { _, stat ->
+            prevEwma = stat?.ewmaMs
+            if (stat == null) LatencyStat(ms, now)
+            else LatencyStat((stat.ewmaMs * 7 + ms * 3) / 10, now)
+        }
+        val base = prevEwma
+        val slow = ms >= SLOW_ABSOLUTE_MS ||
+            (base != null && base > 0 && ms >= SLOW_RELATIVE_FLOOR_MS && ms > base * 3)
+        if (slow) {
+            val streak = slowStreaks.computeIfAbsent(modelId) { AtomicInteger(0) }.incrementAndGet()
+            if (streak >= SLOW_STREAK_THRESHOLD) {
+                slowStreaks.remove(modelId)
+                degradedUntilMap[modelId] = now + DEGRADE_COOLDOWN_MS
+                Log.w(TAG, "Model $modelId degraded: slow responses (${ms}ms), routing around for ${DEGRADE_COOLDOWN_MS / 1000}s")
+            }
+        } else {
+            slowStreaks.remove(modelId)
+        }
+    }
+
+    /** 取模型的真实流量延迟 EWMA（毫秒）；超过新鲜窗口的数据视为未知 */
+    fun getRealLatency(modelId: String): Long? {
+        val stat = realLatencyMap[modelId] ?: return null
+        if (System.currentTimeMillis() - stat.lastAt > LATENCY_FRESH_MS) return null
+        return stat.ewmaMs
+    }
+
+    fun getRealLatencies(): Map<String, Long> =
+        realLatencyMap.keys.mapNotNull { id -> getRealLatency(id)?.let { id to it } }.toMap()
+
+    /** 模型是否处于慢降级冷却期（冷却到期自动恢复参与自动选择） */
+    fun isDegraded(modelId: String): Boolean {
+        val until = degradedUntilMap[modelId] ?: return false
+        if (System.currentTimeMillis() >= until) {
+            degradedUntilMap.remove(modelId)
+            return false
+        }
+        return true
+    }
+
     // 健康检测管理：记录出错前是否为锁定状态，以及健康检测任务是否在运行
     private val healthCheckInfoMap = ConcurrentHashMap<String, HealthCheckInfo>()
 
@@ -108,6 +181,30 @@ object RouterState {
         }
     }
 
+    /** 记录流式首字节时间（TTFT），仅用于展示，不参与 selectFastestModel 排序 */
+    fun updateTTFT(modelId: String, ttftMs: Long) {
+        ttftResultsMap[modelId] = ttftMs
+        _ttftResults.postValue(ttftResultsMap.toMap())
+    }
+
+    fun getTTFTResults(): Map<String, Long> = ttftResultsMap.toMap()
+
+    /**
+     * 记录一次请求失败。
+     * @return true 表示连续失败达到阈值，应判定模型异常（标记错误/解锁/健康检测）；
+     *         false 表示偶发抖动，只需为本次请求切换模型
+     */
+    fun recordFailure(modelId: String): Boolean {
+        val counter = consecutiveFailures.computeIfAbsent(modelId) { AtomicInteger(0) }
+        val n = counter.incrementAndGet()
+        return n >= FAILURE_THRESHOLD
+    }
+
+    /** 请求成功，清零连续失败计数 */
+    fun recordSuccess(modelId: String) {
+        consecutiveFailures.remove(modelId)
+    }
+
     fun updateModelError(modelId: String, error: String) {
         modelErrorMap[modelId] = error
         _modelErrors.postValue(modelErrorMap.toMap())
@@ -149,10 +246,16 @@ object RouterState {
     fun cleanupStaleData(activeModelIds: Set<String>) {
         activeConnections.keys.filter { !activeModelIds.contains(it) }.forEach { activeConnections.remove(it) }
         speedTestResultsMap.keys.filter { !activeModelIds.contains(it) }.forEach { speedTestResultsMap.remove(it) }
+        ttftResultsMap.keys.filter { !activeModelIds.contains(it) }.forEach { ttftResultsMap.remove(it) }
         modelAvailabilityMap.keys.filter { !activeModelIds.contains(it) }.forEach { modelAvailabilityMap.remove(it) }
         modelErrorMap.keys.filter { !activeModelIds.contains(it) }.forEach { modelErrorMap.remove(it) }
+        consecutiveFailures.keys.filter { !activeModelIds.contains(it) }.forEach { consecutiveFailures.remove(it) }
         healthCheckInfoMap.keys.filter { !activeModelIds.contains(it) }.forEach { healthCheckInfoMap.remove(it) }
+        realLatencyMap.keys.filter { !activeModelIds.contains(it) }.forEach { realLatencyMap.remove(it) }
+        slowStreaks.keys.filter { !activeModelIds.contains(it) }.forEach { slowStreaks.remove(it) }
+        degradedUntilMap.keys.filter { !activeModelIds.contains(it) }.forEach { degradedUntilMap.remove(it) }
         _speedTestResults.postValue(speedTestResultsMap.toMap())
+        _ttftResults.postValue(ttftResultsMap.toMap())
         _modelErrors.postValue(modelErrorMap.toMap())
     }
 

@@ -60,32 +60,34 @@ object ConfigManager {
         return getGroups().flatMap { it.models }.find { it.id == modelId }?.timeout ?: 60
     }
 
-    fun selectFastestModel(groupName: String): String? {
+    fun selectFastestModel(groupName: String, exclude: Set<String> = emptySet()): String? {
         val group = getGroups().find { it.name == groupName && it.enabled } ?: return null
         val enabledModels = group.models.filter { it.enabled }
         if (enabledModels.isEmpty()) return null
+        // 慢降级冷却中的模型暂不参与自动选择（全部降级时退化为全部候选）
+        val activeModels = enabledModels.filter { !RouterState.isDegraded(it.id) }.ifEmpty { enabledModels }
+        // 换模型重试时排除已试过的模型，否则大概率重复选中同一个模型，误判"无可用模型"而放弃故障转移
+        val pool = activeModels.filter { it.id !in exclude }
+        if (pool.isEmpty()) return null
         val speedResults = RouterState.getSpeedTestResults()
-        // 优先选择有有效测速结果且可用的模型
-        val available = enabledModels.filter { m ->
-            val rt = speedResults[m.id]
-            rt != null && rt >= 0 && rt <= 120000
-        }
-        // 其次选择未测速但未出错的模型（isModelAvailable 同时检查 errorMap 和 speedResults）
-        val noErrorModels = enabledModels.filter { RouterState.isModelAvailable(it.id) }
-        val candidates = when {
-            available.isNotEmpty() -> available
-            noErrorModels.isNotEmpty() -> noErrorModels
-            else -> enabledModels  // 全部出错时退化，仍尝试请求
-        }
-        val sortedBySpeed = candidates.sortedBy { speedResults[it.id] ?: Long.MAX_VALUE }
-        val bestTime = speedResults[sortedBySpeed.first().id] ?: Long.MAX_VALUE
-        // 当 bestTime < 0（候选模型都是错误状态的 -1），直接从所有候选中选最少连接的
-        if (bestTime < 0) {
+        val realLatencies = RouterState.getRealLatencies()
+        // 排序依据：新鲜的真实流量被动延迟（TTFT EWMA）优先，反映当前真实状况；
+        // 无被动数据时用主动测速结果兜底（冷启动/低流量场景）
+        fun rankOf(m: ConfigModelItem): Long =
+            realLatencies[m.id] ?: speedResults[m.id]?.takeIf { it >= 0 } ?: Long.MAX_VALUE
+        // 已标记错误/测速失败的模型排到最后（isModelAvailable 同时检查 errorMap 和 speedResults）；
+        // 不再按"是否有主动测速结果"分层——自动测速关闭时，被动延迟数据足以参与排序，
+        // 单次手动测速过的模型不应永久压过被动延迟更好的未测速模型。全部不可用时退化为全部候选，仍尝试请求
+        val candidates = pool.filter { RouterState.isModelAvailable(it.id) }.ifEmpty { pool }
+        val sortedBySpeed = candidates.sortedBy { rankOf(it) }
+        val bestTime = rankOf(sortedBySpeed.first())
+        // 当候选模型均无延迟数据时，直接从所有候选中选最少连接的
+        if (bestTime == Long.MAX_VALUE) {
             return candidates.minByOrNull { RouterState.getActiveConnections(it.id) }?.id
         }
         val nearBest = sortedBySpeed.filter { m ->
-            val rt = speedResults[m.id]
-            if (rt == null) true
+            val rt = rankOf(m)
+            if (rt == Long.MAX_VALUE) true
             else rt <= bestTime * 1.5
         }
         return nearBest.minByOrNull { RouterState.getActiveConnections(it.id) }?.id

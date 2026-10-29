@@ -321,7 +321,11 @@ object ProviderManager {
         }
     }
 
-    fun peekNextKey(providerId: String, excludeKey: String): String {
+    /**
+     * 为重试预留一个不同的 KEY（会预先计入限流计数，因为该 KEY 确实会被使用）。
+     * 原名 peekNextKey，但它并非只读——重命名为 reserveNextKey 以明确语义。
+     */
+    fun reserveNextKey(providerId: String, excludeKey: String): String {
         synchronized(lock) {
             val provider = providers.find { it.id == providerId } ?: return ""
             if (provider.apiKeys.isEmpty()) return ""
@@ -352,9 +356,25 @@ object ProviderManager {
         }
     }
 
+    /**
+     * 获取一个 KEY 但不计入限流计数，仅供健康检测/测速等内部探测使用，
+     * 避免探测请求污染限流计数导致 isEarly429 误判。
+     */
+    fun getKeyWithoutCounting(providerId: String): String {
+        synchronized(lock) {
+            val provider = providers.find { it.id == providerId } ?: return ""
+            if (provider.apiKeys.isEmpty()) return ""
+            val keyIdx = providerKeyIndex.getOrPut(providerId) { AtomicInteger(0) }
+            val idx = Math.floorMod(keyIdx.getAndIncrement(), provider.apiKeys.size)
+            return provider.apiKeys[idx]
+        }
+    }
+
     fun isEarly429(providerId: String, currentKey: String): Boolean {
         synchronized(lock) {
             val provider = providers.find { it.id == providerId } ?: return true
+            // 无配额限制时本地计数无参考意义，429 只能是模型级限流 → 判定为 early 429（切换模型）
+            if (provider.rateLimitType == RateLimitType.UNLIMITED) return true
             resetCountersIfNeeded(providerId, provider.rateLimitType)
             val counts = providerRequestCounts[providerId] ?: return true
             val count = counts[currentKey]?.get() ?: 0

@@ -12,7 +12,10 @@ object StatsManager {
     fun recordCall(modelId: String, success: Boolean) {
         totalCalls.incrementAndGet()
         callStats.getOrPut(modelId) { AtomicInteger(0) }.incrementAndGet()
-        if (!success) {
+        if (success) {
+            // 成功请求清零连续失败计数（异常判定阈值见 RouterState.recordFailure）
+            RouterState.recordSuccess(modelId)
+        } else {
             totalErrors.incrementAndGet()
             errorStats.getOrPut(modelId) { AtomicInteger(0) }.incrementAndGet()
         }

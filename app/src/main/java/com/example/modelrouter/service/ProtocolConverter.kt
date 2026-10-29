@@ -106,7 +106,7 @@ object ProtocolConverter {
             val textParts = mutableListOf<String>()
             val toolResults = mutableListOf<JsonObject>()
             val toolUses = mutableListOf<JsonObject>()
-            val imageParts = mutableListOf<JsonObject>()
+            val richParts = mutableListOf<JsonObject>()
 
             for (item in content.asJsonArray) {
                 if (!item.isJsonObject) continue
@@ -124,20 +124,26 @@ object ProtocolConverter {
                         val data = source.s("data") ?: ""
                         val url = source.s("url") ?: ""
                         if (srcType == "base64" && data.isNotEmpty()) {
-                            imageParts.add(JsonObject().apply {
+                            richParts.add(JsonObject().apply {
                                 addProperty("type", "image_url")
                                 add("image_url", JsonObject().apply {
                                     addProperty("url", "data:$mediaType;base64,$data")
                                 })
                             })
                         } else if (srcType == "url" && url.isNotEmpty()) {
-                            imageParts.add(JsonObject().apply {
+                            richParts.add(JsonObject().apply {
                                 addProperty("type", "image_url")
                                 add("image_url", JsonObject().apply {
                                     addProperty("url", url)
                                 })
                             })
                         }
+                    }
+                    "document" -> {
+                        // 文档块不再静默丢弃：转为 OpenAI file 输入，无法转换时退化为文本占位
+                        val docPart = convertAnthropicDocument(itemObj)
+                        if (docPart != null) richParts.add(docPart)
+                        else textParts.add("[document: ${itemObj.s("title") ?: "未知文档"}]")
                     }
                     "tool_result" -> {
                         val toolUseId = itemObj.s("tool_use_id") ?: ""
@@ -149,9 +155,10 @@ object ProtocolConverter {
                             addProperty("content", if (isError && contentStr.isNotEmpty()) "[Tool Error] $contentStr" else contentStr)
                         })
                     }
-                    "tool_use" -> {
+                    "tool_use", "server_tool_use" -> {
+                        val rawId = itemObj.s("id") ?: ""
                         toolUses.add(JsonObject().apply {
-                            addProperty("id", itemObj.s("id") ?: "")
+                            addProperty("id", rawId.ifEmpty { "toolu_gen_${System.currentTimeMillis()}_${toolUses.size}" })
                             addProperty("type", "function")
                             add("function", JsonObject().apply {
                                 addProperty("name", itemObj.s("name") ?: "")
@@ -159,7 +166,13 @@ object ProtocolConverter {
                             })
                         })
                     }
-                    "thinking" -> {
+                    "thinking", "redacted_thinking" -> {
+                    }
+                    else -> {
+                        // 未知类型（web_search_tool_result 等）不再静默丢弃：有文本字段按文本透传，否则保留 JSON
+                        val t = itemObj.s("text") ?: itemObj.s("thinking")
+                        if (t != null) textParts.add(t)
+                        else textParts.add(gson.toJson(itemObj))
                     }
                 }
             }
@@ -178,12 +191,12 @@ object ProtocolConverter {
                         val tcContent = tr.s("content") ?: ""
                         messages.add(msg("tool", tcId, tcContent))
                     }
-                    if (textParts.isNotEmpty() || imageParts.isNotEmpty()) {
-                        addUserContentMessage(messages, textParts, imageParts)
+                    if (textParts.isNotEmpty() || richParts.isNotEmpty()) {
+                        addUserContentMessage(messages, textParts, richParts)
                     }
                 }
-                role == "user" && imageParts.isNotEmpty() -> {
-                    addUserContentMessage(messages, textParts, imageParts)
+                role == "user" && richParts.isNotEmpty() -> {
+                    addUserContentMessage(messages, textParts, richParts)
                 }
                 else -> {
                     val text = textParts.joinToString("\n")
@@ -198,8 +211,8 @@ object ProtocolConverter {
         }
     }
 
-    private fun addUserContentMessage(messages: JsonArray, textParts: List<String>, imageParts: List<JsonObject>) {
-        if (imageParts.isNotEmpty()) {
+    private fun addUserContentMessage(messages: JsonArray, textParts: List<String>, richParts: List<JsonObject>) {
+        if (richParts.isNotEmpty()) {
             val userContent = JsonArray()
             textParts.forEach { tp ->
                 userContent.add(JsonObject().apply {
@@ -207,7 +220,7 @@ object ProtocolConverter {
                     addProperty("text", tp)
                 })
             }
-            imageParts.forEach { ip -> userContent.add(ip) }
+            richParts.forEach { ip -> userContent.add(ip) }
             messages.add(JsonObject().apply {
                 addProperty("role", "user")
                 add("content", userContent)
@@ -215,6 +228,38 @@ object ProtocolConverter {
         } else {
             messages.add(msg("user", textParts.joinToString("\n")))
         }
+    }
+
+    /** Anthropic document 块 → OpenAI file 输入；无法转换时返回 null */
+    private fun convertAnthropicDocument(itemObj: JsonObject): JsonObject? {
+        val source = itemObj.o("source") ?: return null
+        val srcType = source.s("type") ?: ""
+        val mediaType = source.s("media_type") ?: "application/pdf"
+        val data = source.s("data") ?: ""
+        val url = source.s("url") ?: ""
+        if (srcType == "base64" && data.isNotEmpty()) {
+            val ext = when (mediaType) {
+                "application/pdf" -> "pdf"
+                "text/plain" -> "txt"
+                "text/csv" -> "csv"
+                else -> mediaType.substringAfter('/', "bin")
+            }
+            return JsonObject().apply {
+                addProperty("type", "file")
+                add("file", JsonObject().apply {
+                    addProperty("filename", itemObj.s("title") ?: "document.$ext")
+                    addProperty("file_data", "data:$mediaType;base64,$data")
+                })
+            }
+        }
+        if (srcType == "url" && url.isNotEmpty()) {
+            // OpenAI chat 不支持 URL 文件，退化为文本占位以保留上下文
+            return JsonObject().apply {
+                addProperty("type", "text")
+                addProperty("text", "[document: $url]")
+            }
+        }
+        return null
     }
 
     private fun convertAnthropicTools(anthropicBody: JsonObject, openaiBody: JsonObject) {
@@ -296,6 +341,8 @@ object ProtocolConverter {
             responseContent.add(JsonObject().apply {
                 addProperty("type", "thinking")
                 addProperty("thinking", reasoningContent)
+                // Anthropic 协议要求 thinking 块带 signature 字段，缺失会被严格校验的客户端拒收
+                addProperty("signature", "")
             })
         }
 
@@ -307,10 +354,12 @@ object ProtocolConverter {
             })
         }
 
-        for (tc in toolCalls) {
+        for ((tcIdx, tc) in toolCalls.withIndex()) {
+            val rawToolId = tc.s("id") ?: ""
             responseContent.add(JsonObject().apply {
                 addProperty("type", "tool_use")
-                addProperty("id", tc.s("id") ?: "")
+                // 空 id 会被 Anthropic 客户端拒收，兜底生成
+                addProperty("id", rawToolId.ifEmpty { "toolu_gen_${System.currentTimeMillis()}_$tcIdx" })
                 addProperty("name", tc.o("function")?.s("name") ?: "")
                 add("input", try {
                     JsonParser.parseString(tc.o("function")?.s("arguments") ?: "{}")
@@ -375,6 +424,58 @@ object ProtocolConverter {
         cleaned = TC_TAG_RE.replace(cleaned, "")
         cleaned = TC_INCOMPLETE_TAG.replace(cleaned, "")
         return cleaned.trim()
+    }
+
+    /**
+     * 流式标签清洗器：解决 tool_call 标签跨 delta 边界（如 "</func" + "tion>"）时
+     * 按分片清洗清不掉、标签字面量漏进正文的问题。
+     * push() 返回可安全输出的部分（可能为空串），流结束时调用 flush() 输出残留。
+     */
+    class StreamingTagCleaner {
+        private val buffer = StringBuilder()
+
+        // 标签拼写列表：尾部若为其中某个的前缀，则暂存等待下一个 delta
+        private val tagSpellings = listOf(
+            "<function", "</function>", "<tool", "</tool>",
+            "<param", "</param>", "<parameter", "<" + "/parameter>"
+        )
+
+        fun push(text: String): String {
+            if (text.isEmpty()) return ""
+            buffer.append(text)
+            return drain(final = false)
+        }
+
+        fun flush(): String = drain(final = true)
+
+        private fun drain(final: Boolean): String {
+            var content = buffer.toString()
+            content = TC_RESIDUAL.replace(content, "")
+            content = TC_TAG_RE.replace(content, "")
+            if (final) {
+                content = TC_INCOMPLETE_TAG.replace(content, "")
+                buffer.setLength(0)
+                return content
+            }
+            val holdIdx = incompleteTailStart(content)
+            val emit = if (holdIdx >= 0) content.substring(0, holdIdx) else content
+            buffer.setLength(0)
+            if (holdIdx >= 0) buffer.append(content.substring(holdIdx))
+            return emit
+        }
+
+        /** 返回尾部可能为未完成标签的起始下标，无则 -1 */
+        private fun incompleteTailStart(content: String): Int {
+            val lastLt = content.lastIndexOf('<')
+            if (lastLt < 0) return -1
+            val tail = content.substring(lastLt)
+            val lower = tail.lowercase()
+            // 1) 尾部本身就是未完成的标签（如未闭合的 function/tool 标签）
+            if (TC_INCOMPLETE_TAG.containsMatchIn(tail)) return lastLt
+            // 2) 尾部是某标签拼写的前缀（如 "</func"、"<to"）
+            if (tagSpellings.any { it.startsWith(lower) }) return lastLt
+            return -1
+        }
     }
 
     private fun extractContentString(rawContent: com.google.gson.JsonElement?): String {

@@ -1,0 +1,7 @@
+#!/bin/sh
+# 项目自带 arm64 原生 aapt2（提取自 Debian/Ubuntu aapt 包）。
+# 用于替代 Android SDK 自带的 x86-64 aapt2（本机 aarch64 无法运行）。
+# 配置见 gradle.properties: android.aapt2FromMavenOverride
+DIR="$(cd "$(dirname "$0")" && pwd)"
+export LD_LIBRARY_PATH="$DIR/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+exec "$DIR/bin/aapt2" "$@"

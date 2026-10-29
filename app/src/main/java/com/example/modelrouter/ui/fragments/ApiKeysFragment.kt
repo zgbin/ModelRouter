@@ -30,6 +30,27 @@ import kotlinx.coroutines.withContext
 class ApiKeysFragment : Fragment() {
     private lateinit var binding: FragmentApiKeysBinding
 
+    companion object {
+        /**
+         * 本次 APP 运行期内"从API获取"产生的模型变更高亮（累计），APP 重启后自动恢复正常显示。
+         * providerId -> ModelChanges(新增模型 id, 上游已移除模型 id)
+         */
+        private val modelChangeHighlights = mutableMapOf<String, ModelChanges>()
+
+        data class ModelChanges(val added: Set<String>, val removed: Set<String>)
+
+        private fun recordModelChanges(providerId: String, addedNow: Set<String>, removedNow: Set<String>) {
+            val current = modelChangeHighlights[providerId]
+            val added = ((current?.added ?: emptySet()) - removedNow) + addedNow
+            val removed = ((current?.removed ?: emptySet()) - addedNow) + removedNow
+            if (added.isEmpty() && removed.isEmpty()) {
+                modelChangeHighlights.remove(providerId)
+            } else {
+                modelChangeHighlights[providerId] = ModelChanges(added, removed)
+            }
+        }
+    }
+
     override fun onCreateView(
         inflater: LayoutInflater,
         container: ViewGroup?,
@@ -265,7 +286,11 @@ class ApiKeysFragment : Fragment() {
         }
         content.addView(modelsLabel)
 
+        val changes = modelChangeHighlights[provider.id]
         for ((modelIndex, model) in provider.models.withIndex()) {
+            val isAdded = changes?.added?.contains(model.id) == true
+            val isRemoved = changes?.removed?.contains(model.id) == true
+
             val modelRow = LinearLayout(requireContext()).apply {
                 orientation = LinearLayout.HORIZONTAL
                 gravity = Gravity.CENTER_VERTICAL
@@ -278,11 +303,22 @@ class ApiKeysFragment : Fragment() {
 
             val modelText = TextView(requireContext()).apply {
                 text = model.name
-                setTextColor(ContextCompat.getColor(context, R.color.textSecondary))
+                setTextColor(ContextCompat.getColor(context, when {
+                    isAdded -> R.color.accent
+                    isRemoved -> R.color.error
+                    else -> R.color.textSecondary
+                }))
                 textSize = 12f
-                background = ContextCompat.getDrawable(context, R.color.surfaceVariant)
+                background = ContextCompat.getDrawable(context, when {
+                    isAdded -> R.color.accentTransparent
+                    isRemoved -> R.color.chipBackground
+                    else -> R.color.surfaceVariant
+                })
                 setPadding(12, 6, 12, 6)
                 layoutParams = LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f)
+                if (isRemoved) {
+                    paintFlags = paintFlags or android.graphics.Paint.STRIKE_THRU_TEXT_FLAG
+                }
             }
 
             val modelIdHint = TextView(requireContext()).apply {
@@ -317,6 +353,22 @@ class ApiKeysFragment : Fragment() {
 
             modelRow.addView(modelText)
             modelRow.addView(modelIdHint)
+
+            if (isAdded || isRemoved) {
+                val changeTag = TextView(requireContext()).apply {
+                    text = if (isAdded) "新增" else "已移除"
+                    setTextColor(ContextCompat.getColor(context, if (isAdded) R.color.accent else R.color.error))
+                    textSize = 10f
+                    background = ContextCompat.getDrawable(context, R.color.chipBackground)
+                    setPadding(8, 2, 8, 2)
+                    layoutParams = LinearLayout.LayoutParams(
+                        LinearLayout.LayoutParams.WRAP_CONTENT,
+                        LinearLayout.LayoutParams.WRAP_CONTENT
+                    ).apply { marginEnd = 4 }
+                }
+                modelRow.addView(changeTag)
+            }
+
             modelRow.addView(deleteModelBtn)
             content.addView(modelRow)
         }
@@ -675,16 +727,30 @@ class ApiKeysFragment : Fragment() {
             }
 
             val existingIds = provider.models.map { it.id }.toSet()
+            val fetchedIds = result.map { it.id }.toSet()
             val newModels = result.filter { it.id !in existingIds }
-            if (newModels.isEmpty()) {
-                Toast.makeText(context, "没有新模型可添加", Toast.LENGTH_SHORT).show()
+            // 上游已移除：本地还配着、但 API 列表里已不存在的模型（不删除，仅标记）
+            val removedIds = existingIds - fetchedIds
+
+            if (newModels.isEmpty() && removedIds.isEmpty()) {
+                Toast.makeText(context, "模型列表没有变化", Toast.LENGTH_SHORT).show()
                 return@launch
             }
 
-            val mergedModels = provider.models + newModels
-            ProviderManager.updateModels(provider.id, mergedModels)
+            if (newModels.isNotEmpty()) {
+                val mergedModels = provider.models + newModels
+                ProviderManager.updateModels(provider.id, mergedModels)
+            }
+
+            // 记录本次运行期的变更高亮（累计，APP 重启后自动恢复）
+            recordModelChanges(provider.id, newModels.map { it.id }.toSet(), removedIds)
+
             loadData()
-            Toast.makeText(context, "已添加 ${newModels.size} 个新模型 (共${mergedModels.size}个)", Toast.LENGTH_LONG).show()
+            val summary = mutableListOf<String>()
+            if (newModels.isNotEmpty()) summary.add("新增 ${newModels.size} 个")
+            if (removedIds.isNotEmpty()) summary.add("${removedIds.size} 个已下架")
+            val total = ProviderManager.getProvider(provider.id)?.models?.size ?: provider.models.size
+            Toast.makeText(context, "${summary.joinToString("，")} (共${total}个)", Toast.LENGTH_LONG).show()
         }
     }
 
